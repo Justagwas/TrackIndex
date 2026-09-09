@@ -23,9 +23,9 @@
 
 </div>
 
-<p align="center"><b>Organize and play your local music collection</b></p>
+<p align="center"><b>Your Local Music Library Manager & Player</b></p>
 
-<p align="center">Arrange songs visually while TrackIndex keeps filenames, playlists, and playback in step</p>
+<p align="center">Windows music library organizer and local audio player that keeps playlist order synchronized</p>
 
 <div align="center">
 
