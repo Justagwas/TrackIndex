@@ -1,0 +1,9 @@
+PySide6-Essentials==6.11.1
+mutagen==1.48.1
+python-mpv==1.0.8
+winrt-runtime==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+winrt-Windows.Media==3.2.1
+winrt-Windows.Media.Interop==3.2.1
+typing_extensions==4.16.0

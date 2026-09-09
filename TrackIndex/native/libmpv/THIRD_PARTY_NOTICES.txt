@@ -1,0 +1,11 @@
+﻿TrackIndex playback runtime
+
+libmpv e8673660ab
+Source: https://github.com/mpv-player/mpv
+Windows build: https://github.com/shinchiro/mpv-winbuild-cmake
+License: GPL-2.0-or-later by default; see the corresponding mpv and FFmpeg sources.
+Archive SHA-256: 2bdc5da2c8d51a4410f8d5fecc3ab288889b055378e00347404f242900812199
+
+python-mpv 1.0.8
+Source: https://github.com/jaseg/python-mpv
+License: GPL-2.0-or-later or LGPL-2.1-or-later, matching the linked libmpv build
