@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QStackedLayout,
     QStyle,
     QStyleOptionButton,
+    QStyleOptionSlider,
     QStylePainter,
     QVBoxLayout,
     QWidget,
@@ -298,6 +299,8 @@ class MetadataLabel(QLabel):
 
 
 class HoverSeekSlider(QSlider):
+    valueCommitted = Signal(int)
+
     def __init__(self, parent=None) -> None:
         super().__init__(Qt.Orientation.Horizontal, parent)
         self._player_style: RoundHandleSliderStyle | None = None
@@ -369,16 +372,61 @@ class HoverSeekSlider(QSlider):
     def keyPressEvent(self, event) -> None:
         self._keyboard_focus = True
         self._set_handle_visible(True)
+        previous = self.value()
         super().keyPressEvent(event)
+        if self.value() != previous and not self._pressed:
+            self.valueCommitted.emit(self.value())
+
+    def wheelEvent(self, event) -> None:
+        previous = self.value()
+        super().wheelEvent(event)
+        if self.value() != previous and not self._pressed:
+            self.valueCommitted.emit(self.value())
+
+    def cancel_drag(self) -> None:
+        self._pressed = False
+        self.setSliderDown(False)
+        if not self.underMouse() and not self._keyboard_focus:
+            self._set_handle_visible(False)
 
     def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
         self._pressed = True
         self._set_handle_visible(True)
-        super().mousePressEvent(event)
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.setSliderDown(True)
+        self._set_position_from_pointer(event.position().x())
+        event.accept()
+
+    def _set_position_from_pointer(self, x: float) -> None:
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, option, QStyle.SubControl.SC_SliderGroove, self,
+        )
+        span = max(1, groove.width() - 1)
+        position = max(0, min(span, round(x - groove.left())))
+        self.setSliderPosition(QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), position, span, option.upsideDown,
+        ))
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._pressed:
+            self._set_position_from_pointer(event.position().x())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        super().mouseReleaseEvent(event)
+        if not self._pressed or event.button() != Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+        self._set_position_from_pointer(event.position().x())
+        self.setSliderDown(False)
         self._pressed = False
+        event.accept()
         if not self.underMouse() and not self._keyboard_focus:
             self._set_handle_visible(False)
 
@@ -627,6 +675,7 @@ class PlayerPanel(QFrame):
         self.seek.sliderPressed.connect(self._begin_scrub)
         self.seek.sliderReleased.connect(self._finish_scrub)
         self.seek.sliderMoved.connect(self._preview_scrub)
+        self.seek.valueCommitted.connect(self._commit_seek_value)
         self.duration = QLabel("--", center)
         self.duration.setObjectName("playerTime")
         self.duration.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -873,7 +922,7 @@ class PlayerPanel(QFrame):
             if button in (self.play_button, self.mini_play_button):
                 name = "pause" if self.snapshot.state is PlaybackState.PLAYING else "play"
             elif button is self.mute_button:
-                name = "muted" if self.snapshot.muted else "volume"
+                name = "muted" if self.snapshot.muted or self.snapshot.volume == 0 else "volume"
             elif button is self.collapse_button:
                 name = "expand" if self.presentation is PlayerPresentation.MINI else "collapse"
             elif button is self.repeat_button:
@@ -895,6 +944,13 @@ class PlayerPanel(QFrame):
 
     def set_snapshot(self, snapshot: PlaybackSnapshot) -> None:
         previous_state = self.snapshot.state
+        previous_entry = self.snapshot.entry
+        entry = snapshot.entry
+        previous_id = (previous_entry.library_id, previous_entry.track_id) if previous_entry else None
+        entry_id = (entry.library_id, entry.track_id) if entry else None
+        if self._scrubbing and previous_id != entry_id:
+            self._scrubbing = False
+            self.seek.cancel_drag()
         self.snapshot = snapshot
         entry = snapshot.entry
         if entry is not None:
@@ -1107,12 +1163,15 @@ class PlayerPanel(QFrame):
             self.mini_elapsed.setText(text)
 
     def _finish_scrub(self) -> None:
-        duration = self.snapshot.duration_seconds or 0.0
+        if not self._scrubbing:
+            return
         self._scrubbing = False
+        self._commit_seek_value(self.seek.value())
+
+    def _commit_seek_value(self, value: int) -> None:
+        duration = self.snapshot.duration_seconds or 0.0
         if duration > 0:
-            sender = self.sender()
-            slider = sender if isinstance(sender, QSlider) else self.seek
-            self.seekRequested.emit(duration * slider.value() / 1000)
+            self.seekRequested.emit(duration * value / 1000)
 
     def _interpolate_position(self) -> None:
         if self.snapshot.state is not PlaybackState.PLAYING or self._scrubbing:

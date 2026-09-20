@@ -24,7 +24,7 @@ from trackindex.controller.coordination_services import (
 from trackindex.core import self_updater
 from trackindex.core.artwork_service import ArtworkStore, PreparedArtwork
 from trackindex.core.concurrency import ReadWriteLock
-from trackindex.core.config import APP_VERSION, DOWNLOAD_PAGE_URL, default_playlist_name
+from trackindex.core.config import DOWNLOAD_PAGE_URL, default_playlist_name
 from trackindex.core.config_service import AppConfig, default_config, save_config
 from trackindex.core.diagnostics import diagnostics_logger, register_private_path
 from trackindex.core.library_service import (
@@ -894,6 +894,9 @@ class AppController(QObject):
     def _refresh_setup_view(self) -> None:
         if not self._setup_active or self.audit is None or self.current_library is None:
             return
+        if not self.audit.tracks and not self._setup_reconfiguring:
+            self.window.close_library_setup()
+            return
         target = self.current_library.folder / self._setup_playlist_name
         if self._setup_mode is StorageMode.FILENAMES and self._setup_source_playlist is not None:
             target = self._setup_source_playlist
@@ -966,7 +969,7 @@ class AppController(QObject):
         if self.current_library is None:
             return
         self._setup_active = True
-        self._setup_reconfiguring = self.current_library.setup_completed
+        self._setup_reconfiguring = True
         self._setup_mode = StorageMode(self.current_library.storage_mode)
         if self._setup_mode is StorageMode.FILENAMES:
             self.selected_authority = OrderAuthority.FILENAMES
@@ -976,9 +979,9 @@ class AppController(QObject):
             self._refresh_setup_view()
 
     def _cancel_setup(self) -> None:
-        if self.current_library is None or not self.current_library.setup_completed:
+        if self.current_library is None:
             return
-        self._setup_active = False
+        self._setup_active = not self.current_library.setup_completed
         self._setup_reconfiguring = False
         mode = StorageMode(self.current_library.storage_mode)
         self.selected_authority = (
@@ -2052,9 +2055,9 @@ class AppController(QObject):
         if self._shutdown_started:
             return
         if not check.update_available:
-            self.window.settings_panel.set_update_status(f"TrackIndex {APP_VERSION} is current.")
+            self.window.settings_panel.set_update_status("")
             if self._updates.manual:
-                styled_message(self.window, QMessageBox.Icon.Information, "No update available", f"TrackIndex {APP_VERSION} is up to date.").exec()
+                styled_message(self.window, QMessageBox.Icon.Information, "No update available", "You are already on the latest version").exec()
             return
         self.window.settings_panel.set_update_status(f"TrackIndex {check.latest_version} is available.")
         self._updates.record_check(check)

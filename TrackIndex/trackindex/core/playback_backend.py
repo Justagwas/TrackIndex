@@ -261,6 +261,7 @@ class LibMpvBackend:
             self._pending_current_generation = generation
             self._pending_lookahead_generation = 0
         try:
+            player.keep_open = "always" if paused else "no"
             player.command("loadfile", str(path), "replace")
             player.pause = bool(paused)
         except Exception:
@@ -296,7 +297,12 @@ class LibMpvBackend:
             self._pending_lookahead_generation = 0
 
     def set_paused(self, paused: bool) -> None:
-        self._require_player().pause = bool(paused)
+        player = self._require_player()
+        if paused:
+            player.keep_open = "always"
+        player.pause = bool(paused)
+        if not paused:
+            player.keep_open = "no"
 
     def seek(self, seconds: float) -> None:
         self._require_player().command("seek", max(0.0, float(seconds)), "absolute", "exact")

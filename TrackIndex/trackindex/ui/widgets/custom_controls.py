@@ -210,7 +210,10 @@ class SquareCheckBoxStyle(QProxyStyle):
         return super().subElementRect(element, option, widget)
 
     def drawPrimitive(self, element, option, painter, widget=None):
-        if element != QStyle.PrimitiveElement.PE_IndicatorCheckBox:
+        if element not in {
+            QStyle.PrimitiveElement.PE_IndicatorCheckBox,
+            QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck,
+        }:
             super().drawPrimitive(element, option, painter, widget)
             return
 

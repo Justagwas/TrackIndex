@@ -4,7 +4,7 @@ from pathlib import Path
 
 APP_NAME = "TrackIndex"
 APP_SHORT_NAME = "TrackIndex"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 CONFIG_SCHEMA_VERSION = 5
 CONFIG_FILENAME = "trackindex_config.json"
 INNO_SETUP_APP_ID = "TrackIndexJustagwas"

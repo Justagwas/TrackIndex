@@ -458,13 +458,7 @@ class MainWindow(QMainWindow):
         self.open_playlist_folder_button.setEnabled(audit.folder.is_dir())
         sync_pointer_cursor(self.open_playlist_folder_button)
         self._set_library_context_visible(True)
-        if tracks:
-            self.track_stack.setCurrentWidget(self._track_list_page)
-        else:
-            self._show_library_state(
-                "No tracks found",
-                "This playlist folder has no supported audio files.",
-            )
+        self.track_stack.setCurrentWidget(self._track_list_page)
         self._sync_responsive_setup_layout()
 
     def show_library_setup(

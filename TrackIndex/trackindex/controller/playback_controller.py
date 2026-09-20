@@ -307,16 +307,16 @@ class PlaybackController(QObject):
         table = self.window.track_table
         table.playbackRequested.connect(self.start_track)
         table.dragStateChanged.connect(panel.set_drag_compact)
-        panel.playPauseRequested.connect(self.toggle_play_pause)
-        panel.previousRequested.connect(self.previous)
-        panel.nextRequested.connect(self.next)
-        panel.stopRequested.connect(self.stop)
-        panel.seekRequested.connect(self.seek)
-        panel.volumeChanged.connect(self.set_volume)
-        panel.muteChanged.connect(self.set_muted)
-        panel.shuffleChanged.connect(self.set_shuffle)
-        panel.repeatChanged.connect(self.set_repeat)
-        panel.closeRequested.connect(self.close)
+        panel.playPauseRequested.connect(lambda: self.dispatch_transport("toggle"))
+        panel.previousRequested.connect(lambda: self.dispatch_transport("previous"))
+        panel.nextRequested.connect(lambda: self.dispatch_transport("next"))
+        panel.stopRequested.connect(lambda: self.dispatch_transport("stop"))
+        panel.seekRequested.connect(lambda value: self.dispatch_transport("seek", value))
+        panel.volumeChanged.connect(lambda value: self.dispatch_transport("set-volume", value))
+        panel.muteChanged.connect(lambda value: self.dispatch_transport("set-muted", value))
+        panel.shuffleChanged.connect(lambda value: self.dispatch_transport("set-shuffle", value))
+        panel.repeatChanged.connect(lambda value: self.dispatch_transport("set-repeat", value))
+        panel.closeRequested.connect(lambda: self.dispatch_transport("close"))
         panel.presentationRequested.connect(self.set_presentation)
         panel.currentTrackRequested.connect(self.reveal_current_track)
 
@@ -389,6 +389,7 @@ class PlaybackController(QObject):
 
     def dispatch_transport(self, command: str, value: object = None) -> None:
         if self._stopping or self._mutation_library_id:
+            self.window.player_panel.set_snapshot(self.snapshot)
             return
         if command in {"toggle", "play", "pause"}:
             if self.snapshot.entry is None and command != "pause":
@@ -409,6 +410,11 @@ class PlaybackController(QObject):
                 self.toggle_play_pause()
             return
         handlers: dict[str, Callable[[], None]] = {
+            "close": self.close,
+            "set-volume": lambda: self.set_volume(int(str(value))),
+            "set-muted": lambda: self.set_muted(bool(value)),
+            "set-shuffle": lambda: self.set_shuffle(bool(value)),
+            "set-repeat": lambda: self.set_repeat(str(value)),
             "next": self.next, "previous": self.previous, "stop": self.stop,
             "seek-forward": lambda: self.seek(self.snapshot.position_seconds + 5),
             "seek-backward": lambda: self.seek(self.snapshot.position_seconds - 5),
@@ -468,7 +474,7 @@ class PlaybackController(QObject):
 
     @Slot(str)
     def start_track(self, track_id: str) -> None:
-        if self._stopping:
+        if self._stopping or self._mutation_library_id:
             return
         if self._availability_error:
             self.window.show_toast("Playback runtime unavailable", None)
@@ -546,6 +552,7 @@ class PlaybackController(QObject):
 
     @Slot()
     def next(self, *, natural: bool = False) -> None:
+        paused = natural and self.snapshot.state is PlaybackState.PAUSED
         entry = self.queue.advance(natural=natural)
         if entry is None:
             self.stop()
@@ -554,20 +561,20 @@ class PlaybackController(QObject):
             self._handle_entry_error(entry, "The audio file is missing.")
             return
         if natural and entry.track_id == self._backend_lookahead_id:
-            self._adopt_prefetched_entry(entry)
+            self._adopt_prefetched_entry(entry, paused=paused)
             return
-        self._load_entry(entry)
+        self._load_entry(entry, paused=paused)
 
-    def _adopt_prefetched_entry(self, entry: QueueEntry) -> None:
+    def _adopt_prefetched_entry(self, entry: QueueEntry, *, paused: bool = False) -> None:
         self._backend_lookahead_id = ""
         self._active_backend_generation = self._backend_lookahead_generation
         self._backend_lookahead_generation = 0
         self._awaiting_prefetched_load = True
         self._ignore_ended_until_loaded = True
-        self._play_after_load = True
+        self._play_after_load = not paused
         self.snapshot = replace(
             self.snapshot,
-            state=PlaybackState.LOADING,
+            state=PlaybackState.PAUSED if paused else PlaybackState.LOADING,
             presentation=PlayerPresentation.EXPANDED,
             entry=entry,
             position_seconds=0.0,
@@ -576,7 +583,9 @@ class PlaybackController(QObject):
             error="",
         )
         self.window.player_panel.set_snapshot(self.snapshot)
-        self.window.track_table.set_playback_state(entry.track_id, True)
+        self.window.track_table.set_playback_state(entry.track_id, not paused)
+        if paused:
+            self.commandRequested.emit("pause", True)
 
     @Slot()
     def previous(self) -> None:
@@ -657,6 +666,7 @@ class PlaybackController(QObject):
         value = max(0, min(100, int(volume)))
         self.snapshot = replace(self.snapshot, volume=value)
         self.config.playback_volume = value
+        self.window.player_panel.set_snapshot(self.snapshot)
         self.commandRequested.emit("volume", value)
         self._config_timer.start()
 

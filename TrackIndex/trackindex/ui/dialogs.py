@@ -290,6 +290,23 @@ def styled_message(parent: QWidget, icon: QMessageBox.Icon, title: str, text: st
     return box
 
 
+def _apply_checkbox_style(widget: QWidget, parent: QWidget | None) -> None:
+    theme = getattr(parent, "theme", None)
+    if theme is None:
+        return
+    scale = max(0.75, min(2.0, float(getattr(parent, "ui_scale_percent", 100)) / 100.0))
+    style = SquareCheckBoxStyle(
+        border_color=theme.border,
+        fill_color=theme.accent,
+        check_color=theme.text_primary,
+        size=max(14, round(20 * scale)),
+        radius=max(2, round(4 * scale)),
+        parent=widget,
+    )
+    style.setParent(widget)
+    widget.setStyle(style)
+
+
 class DeleteTracksDialog(QDialog):
 
 
@@ -315,6 +332,7 @@ class DeleteTracksDialog(QDialog):
         detail.setObjectName("settingsSubtext")
         layout.addWidget(detail)
         self.dont_ask_again = QCheckBox("Don't show this confirmation again", self)
+        _apply_checkbox_style(self.dont_ask_again, parent)
         layout.addWidget(self.dont_ask_again)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.No, self)
         buttons.button(QDialogButtonBox.StandardButton.Yes).setText("Remove")
@@ -339,6 +357,7 @@ class LibraryImportDialog(QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         self.list = _LibraryImportList(self)
+        _apply_checkbox_style(self.list, parent)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.list.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)

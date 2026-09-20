@@ -1564,6 +1564,13 @@ class TrackTableView(QTableView):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         painter.fillRect(event.rect(), QColor(self._delegate.theme.app_bg))
+        if self.track_model.rowCount() == 0:
+            painter.setPen(QColor(self._delegate.theme.text_secondary))
+            painter.drawText(
+                self.viewport().rect().adjusted(16, 16, -16, -16),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                "Drag audio files here to add tracks to this playlist.",
+            )
         now = monotonic()
         if self._drag is not None:
             self._paint_animated_rows(painter, now)
