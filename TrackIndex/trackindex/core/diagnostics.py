@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import threading
-from logging.handlers import RotatingFileHandler
+from contextlib import suppress
 from pathlib import Path
 
+from .filesystem import is_link_like
 from .paths import product_data_dir
 
 _LOCK = threading.Lock()
@@ -44,35 +46,41 @@ def redact_diagnostic_text(value: str) -> str:
     return rendered
 
 
-def configure_diagnostics(root: Path | None = None) -> logging.Logger:
+def configure_diagnostics() -> logging.Logger:
     global _CONFIGURED
     logger = logging.getLogger("trackindex")
     with _LOCK:
         if _CONFIGURED:
             return logger
-        destination = root or product_data_dir() / "logs"
-        try:
-            destination.mkdir(parents=True, exist_ok=True)
-            handler = RotatingFileHandler(
-                destination / "trackindex.log",
-                maxBytes=1024 * 1024,
-                backupCount=3,
-                encoding="utf-8",
-                delay=True,
-            )
+        if sys.stderr is not None:
+            handler = logging.StreamHandler(sys.stderr)
             handler.setFormatter(
                 _PrivatePathFormatter(
                     "%(asctime)s %(levelname)s %(name)s %(message)s",
                     "%Y-%m-%dT%H:%M:%S",
                 )
             )
-            logger.addHandler(handler)
-        except OSError:
-            logger.addHandler(logging.NullHandler())
+        else:
+            handler = logging.NullHandler()
+        logger.addHandler(handler)
         logger.setLevel(logging.INFO)
         logger.propagate = False
         _CONFIGURED = True
     return logger
+
+
+def cleanup_legacy_logs() -> None:
+    storage = product_data_dir()
+    folder = storage / "logs"
+    if is_link_like(storage) or is_link_like(folder) or not folder.is_dir():
+        return
+    for name in ("trackindex.log", "trackindex.log.1", "trackindex.log.2", "trackindex.log.3"):
+        path = folder / name
+        if not is_link_like(path) and path.is_file():
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+    with suppress(OSError):
+        folder.rmdir()
 
 
 def diagnostics_logger(name: str) -> logging.Logger:

@@ -4,13 +4,14 @@ from pathlib import Path
 
 APP_NAME = "TrackIndex"
 APP_SHORT_NAME = "TrackIndex"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 CONFIG_SCHEMA_VERSION = 5
 CONFIG_FILENAME = "trackindex_config.json"
 INNO_SETUP_APP_ID = "TrackIndexJustagwas"
 MUTEX_NAME = "TrackIndexMutex"
 
 OFFICIAL_PAGE_URL = "https://www.justagwas.com/projects/trackindex"
+DONATE_PAGE_URL = "https://www.justagwas.com/donate"
 DOWNLOAD_PAGE_URL = "https://www.justagwas.com/projects/trackindex/download"
 UPDATE_MANIFEST_URL = "https://www.justagwas.com/projects/trackindex/latest.json"
 UPDATE_SETUP_FALLBACK_URL = "https://downloads.justagwas.com/trackindex/TrackIndexSetup.exe"

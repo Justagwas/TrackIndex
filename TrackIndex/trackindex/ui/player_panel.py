@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 from trackindex.core.playback import PlaybackSnapshot, PlaybackState, PlayerPresentation, RepeatMode
 
 from .interaction import sync_pointer_cursor
+from .footer import FooterButton
 from .theme import ThemePalette
 from .track_list import format_duration
 from .widgets.custom_controls import RoundHandleSliderStyle
@@ -55,18 +56,17 @@ def _icon(
     size: int,
     device_pixel_ratio: float,
     active: bool = False,
-    primary: bool = False,
 ) -> QIcon:
     ratio = max(1.0, float(device_pixel_ratio))
     key = (
         theme.mode,
         theme.text_primary,
         theme.accent,
+        theme.accent_hover,
         name,
         int(size),
         round(ratio, 2),
         bool(active),
-        bool(primary),
     )
     cached = _ICON_CACHE.get(key)
     if cached is not None:
@@ -79,8 +79,9 @@ def _icon(
     painter = QPainter(pixmap)
     painter.scale(ratio, ratio)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    color = QColor("#FFFFFF" if primary else theme.accent if active else theme.text_primary)
-    pen = QPen(color, max(1.35, size * 0.078), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    accent = theme.accent_hover if theme.mode == "dark" else theme.accent
+    color = QColor(accent if active else theme.text_primary)
+    pen = QPen(color, size * (2.4 / 24), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen)
     painter.setBrush(color)
     center = size / 2
@@ -92,8 +93,8 @@ def _icon(
         path.closeSubpath()
         painter.drawPath(path)
     elif name == "pause":
-        painter.drawRoundedRect(QRectF(size * 0.34, size * 0.27, size * 0.1, size * 0.46), size * 0.03, size * 0.03)
-        painter.drawRoundedRect(QRectF(size * 0.56, size * 0.27, size * 0.1, size * 0.46), size * 0.03, size * 0.03)
+        painter.drawRoundedRect(QRectF(size * 0.31, size * 0.27, size * 0.1, size * 0.46), size * 0.03, size * 0.03)
+        painter.drawRoundedRect(QRectF(size * 0.59, size * 0.27, size * 0.1, size * 0.46), size * 0.03, size * 0.03)
     elif name in {"previous", "next"}:
         previous = name == "previous"
         bar_x = size * (0.29 if previous else 0.71)
@@ -194,9 +195,9 @@ def _icon(
     return icon
 
 
-class PlayerIconButton(QPushButton):
+class PlayerIconButton(FooterButton):
     def __init__(self, parent=None) -> None:
-        super().__init__(parent)
+        super().__init__("", parent)
         self._previous_icon = QIcon()
         self._icon_progress = 1.0
         self._icon_animation = QVariantAnimation(self)
@@ -233,6 +234,8 @@ class PlayerIconButton(QPushButton):
     def paintEvent(self, event) -> None:
         option = QStyleOptionButton()
         self.initStyleOption(option)
+        if not self.property("keyboardFocus"):
+            option.state &= ~QStyle.StateFlag.State_HasFocus
         option.icon = QIcon()
         option.text = ""
         painter = QStylePainter(self)
@@ -246,11 +249,11 @@ class PlayerIconButton(QPushButton):
         ).toRect()
         if not self._previous_icon.isNull() and self._icon_progress < 1.0:
             painter.save()
-            painter.setOpacity(1.0 - self._icon_progress)
+            painter.setOpacity((1.0 - self._icon_progress) * (1.0 if self.isEnabled() else 0.4))
             self._previous_icon.paint(painter, rect)
             painter.restore()
         painter.save()
-        painter.setOpacity(self._icon_progress)
+        painter.setOpacity(self._icon_progress * (1.0 if self.isEnabled() else 0.4))
         self.icon().paint(painter, rect)
         painter.restore()
 
@@ -612,6 +615,20 @@ class PlayerPanel(QFrame):
         self.setObjectName("playerPanel")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._build()
+        self._seek_style = RoundHandleSliderStyle(
+            handle_color=theme.text_primary,
+            border_color=theme.border,
+            groove_color=theme.border,
+            fill_color=theme.text_secondary,
+            parent=self.seek,
+        )
+        self._volume_style = RoundHandleSliderStyle(
+            handle_color=theme.text_primary,
+            border_color=theme.border,
+            groove_color=theme.border,
+            fill_color=theme.text_secondary,
+            parent=self.volume,
+        )
         self.setMinimumHeight(0)
         self.setMaximumHeight(0)
         self.hide()
@@ -830,33 +847,31 @@ class PlayerPanel(QFrame):
         self._root_layout.setContentsMargins(margin_x, margin_y, margin_x, margin_y)
         self._root_layout.setSpacing(max(8, round(14 * self.scale)))
         self._left_layout.setSpacing(max(6, round(10 * self.scale)))
-        self._seek_style = RoundHandleSliderStyle(
+        self._seek_style.set_colors(
             handle_color=theme.text_primary,
             border_color=theme.border,
             groove_color=theme.border,
             fill_color=theme.text_secondary,
-            parent=self.seek,
         )
         self._seek_style.set_metrics(
             handle_size=max(10, round(12 * self.scale)),
             groove_height=max(2, round(3 * self.scale)),
         )
         self.seek.set_player_style(self._seek_style, theme.text_secondary, theme.accent)
-        self._volume_style = RoundHandleSliderStyle(
+        self._volume_style.set_colors(
             handle_color=theme.text_primary,
             border_color=theme.border,
             groove_color=theme.border,
-            fill_color=theme.accent,
-            parent=self.volume,
+            fill_color=theme.text_secondary,
         )
         self._volume_style.set_metrics(
             handle_size=max(10, round(12 * self.scale)),
             groove_height=max(3, round(4 * self.scale)),
             vertical_offset=max(1, round(self.scale)),
         )
-        self.volume.set_player_style(self._volume_style, theme.accent, theme.accent)
+        self.volume.set_player_style(self._volume_style, theme.text_secondary, theme.accent)
         self._mini_seek_style = self._seek_style
-        secondary_size = max(22, round(26 * self.scale))
+        secondary_size = max(22, round(30 * self.scale))
         primary_size = max(30, round(38 * self.scale))
         mini_primary_size = max(26, round(32 * self.scale))
         side_width = max(150, mini_primary_size + 4 * secondary_size + 4 * max(3, round(4 * self.scale)))
@@ -932,13 +947,11 @@ class PlayerPanel(QFrame):
                 else:
                     active = self.snapshot.repeat is RepeatMode.ALL
             if primary:
-                logical_icon_size = 18 if button is self.play_button else 16
-            elif button in (self.collapse_button, self.close_button):
-                logical_icon_size = 14
+                logical_icon_size = 22 if button is self.play_button else 20
             else:
-                logical_icon_size = 16
+                logical_icon_size = 20
             icon_size = max(13, round(logical_icon_size * self.scale))
-            icon = _icon(self.theme, name, icon_size, ratio, active, primary)
+            icon = _icon(self.theme, name, icon_size, ratio, active)
             button.setIconSize(QSize(icon_size, icon_size))
             button.set_player_icon(icon, animate_play and primary)
 
@@ -1085,8 +1098,8 @@ class PlayerPanel(QFrame):
             effect.setEnabled(opacity < 1.0)
             widget.setVisible(opacity > 0.0)
             widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, opacity < 0.5)
-        secondary = max(22, round(26 * self.scale))
-        mini_primary = max(26, round(32 * self.scale))
+        secondary = self.close_button.height()
+        mini_primary = self.mini_play_button.height()
         self._right_top.setFixedHeight(round(secondary * expanded + mini_primary * (1.0 - expanded)))
         self._volume_row.setFixedHeight(round(max(30, round(38 * self.scale)) * expanded))
         self._timeline_tail.setFixedHeight(round(max(30, round(38 * self.scale)) * expanded))
@@ -1108,7 +1121,10 @@ class PlayerPanel(QFrame):
         spacing = self._root_layout.spacing()
         available = self.width() - margins.left() - margins.right()
         secondary = self.close_button.width()
-        right_width = self.mini_play_button.width() + 4 * secondary + 4 * self._top_layout.spacing()
+        right_width = max(
+            self.mini_play_button.width() + 4 * secondary + 4 * self._top_layout.spacing(),
+            self._volume_layout.minimumSize().width(),
+        )
         center_width = max(self._transport_layout.minimumSize().width(),
                            self.elapsed.width() + self.duration.width() + 16 + round(64 * self.scale))
         artwork_width = max(30, round(64 * self.scale))
@@ -1130,9 +1146,6 @@ class PlayerPanel(QFrame):
         if not show_text:
             self._left.setMaximumWidth(artwork_width)
             self._right.setMaximumWidth(right_width)
-        volume_width = max(round(48 * self.scale), min(round(92 * self.scale),
-                           round((available - center_width - right_width) / 2)))
-        self.volume.setFixedWidth(volume_width)
 
     def set_drag_compact(self, active: bool) -> None:
         if active:

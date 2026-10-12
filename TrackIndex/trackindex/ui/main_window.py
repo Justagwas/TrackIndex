@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from trackindex.core.config import APP_NAME, APP_VERSION, OFFICIAL_PAGE_URL
+from trackindex.core.config import APP_NAME, DONATE_PAGE_URL, OFFICIAL_PAGE_URL
 from trackindex.core.models import (
     AuditResult,
     LibraryRecord,
@@ -56,6 +56,7 @@ from .interaction import (
     sync_pointer_cursor,
 )
 from .library_list import LibraryList
+from .footer import FooterButton, build_footer_icon, build_footer_stylesheet, describe_footer_button
 from .player_panel import PlayerPanel
 from .settings_panel import SettingsPanel
 from .setup_panel import LibrarySetupPanel
@@ -106,6 +107,7 @@ class MainWindow(QMainWindow):
         self._current_storage_mode = StorageMode.BOTH
         self._has_filename_prefixes = False
         self._audit_blocked = False
+        self._closing = False
         self.setWindowTitle(APP_NAME)
         self.resize(1000, 720)
         self.setMinimumSize(self._minimum_window_width(), 600)
@@ -190,8 +192,10 @@ class MainWindow(QMainWindow):
 
         self.save_status = QLabel("", main)
         self.save_status.setObjectName("muted")
+        self.save_status.setWordWrap(True)
         self.save_status.hide()
         layout.addLayout(header)
+        layout.addWidget(self.save_status)
 
         self.authority_banner = QFrame(main)
         self.authority_banner.setObjectName("authorityBanner")
@@ -322,39 +326,51 @@ class MainWindow(QMainWindow):
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(2, 0, 2, 0)
         footer_layout.setSpacing(8)
-        self.theme_button = QPushButton("", footer)
+        self._footer_layout = footer_layout
+        self.theme_button = FooterButton("", footer)
         self.theme_button.setObjectName("footerIcon")
         self.theme_button.setFlat(True)
         self.theme_button.setIconSize(QSize(20, 20))
         self.theme_button.clicked.connect(self._toggle_theme)
-        self.pin_button = QPushButton("", footer)
+        self.pin_button = FooterButton("", footer)
         self.pin_button.setObjectName("footerIcon")
         self.pin_button.setFlat(True)
         self.pin_button.setCheckable(True)
         self.pin_button.setIconSize(QSize(20, 20))
         self.pin_button.toggled.connect(self.set_pinned)
-        self.settings_toggle_button = QPushButton("Show settings", footer)
-        self.settings_toggle_button.setObjectName("footerLink")
+        self.settings_toggle_button = FooterButton("", footer)
+        self.settings_toggle_button.setObjectName("footerIcon")
+        self.settings_toggle_button.setCheckable(True)
         self.settings_toggle_button.setFlat(True)
         self.settings_toggle_button.clicked.connect(self.toggle_settings)
-        self.open_playlist_folder_button = QPushButton("Open playlist folder", footer)
-        self.open_playlist_folder_button.setObjectName("footerLink")
+        self.open_playlist_folder_button = FooterButton("", footer)
+        self.open_playlist_folder_button.setObjectName("footerIcon")
         self.open_playlist_folder_button.setFlat(True)
         self.open_playlist_folder_button.setEnabled(False)
         self.open_playlist_folder_button.clicked.connect(self.currentLibraryExplorerRequested.emit)
-        self.official_button = QPushButton("Official website", footer)
-        self.official_button.setObjectName("footerLink")
+        self.official_button = FooterButton("", footer)
+        self.official_button.setObjectName("footerIcon")
         self.official_button.setFlat(True)
         self.official_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(OFFICIAL_PAGE_URL)))
-        self.version_label = QLabel(f"v{APP_VERSION}", footer)
-        self.version_label.setObjectName("footerVersion")
+        self.donate_button = FooterButton("Donate", footer)
+        self.donate_button.setObjectName("footerDonate")
+        self.donate_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(DONATE_PAGE_URL)))
+        for button, name, description in (
+            (self.theme_button, "Color theme", "Switch between light and dark mode"),
+            (self.pin_button, "Keep window on top", "Pin or unpin this window"),
+            (self.settings_toggle_button, "Settings", "Show or hide settings"),
+            (self.open_playlist_folder_button, "Open playlist folder", "Open the selected playlist folder"),
+            (self.official_button, "Official website", "Open the TrackIndex website in your browser"),
+            (self.donate_button, "Donate", "Support Justagwas with an optional donation in your browser"),
+        ):
+            describe_footer_button(button, name, description)
         footer_layout.addWidget(self.theme_button, 0, Qt.AlignmentFlag.AlignLeft)
         footer_layout.addWidget(self.pin_button, 0, Qt.AlignmentFlag.AlignLeft)
         footer_layout.addWidget(self.settings_toggle_button, 0, Qt.AlignmentFlag.AlignLeft)
         footer_layout.addStretch(1)
         footer_layout.addWidget(self.open_playlist_folder_button, 0, Qt.AlignmentFlag.AlignRight)
         footer_layout.addWidget(self.official_button, 0, Qt.AlignmentFlag.AlignRight)
-        footer_layout.addWidget(self.version_label, 0, Qt.AlignmentFlag.AlignRight)
+        footer_layout.addWidget(self.donate_button, 0, Qt.AlignmentFlag.AlignRight)
         outer.addWidget(footer, 0)
 
     def resizeEvent(self, event) -> None:
@@ -470,19 +486,20 @@ class MainWindow(QMainWindow):
         playlist_name: str,
         reconfiguring: bool,
         plan=None,
+        *, pending: bool = False,
     ) -> None:
         self._current_library_id = record.library_id
         self._current_storage_mode = mode
         self._has_filename_prefixes = any(track.filename_index is not None for track in audit.tracks)
         self.setup_panel.set_context(audit, record, mode, authority, playlist_name, reconfiguring)
-        self.setup_panel.set_plan(plan, audit.requires_authority_choice and authority is None)
+        self.setup_panel.set_plan(plan, audit.requires_authority_choice and authority is None, pending=pending)
         self.authority_banner.hide()
         self._set_library_context_visible(True)
         self.track_stack.setCurrentWidget(self.setup_panel)
         self._sync_responsive_setup_layout()
 
-    def update_setup_plan(self, plan, needs_source: bool = False) -> None:
-        self.setup_panel.set_plan(plan, needs_source)
+    def update_setup_plan(self, plan, needs_source: bool = False, *, pending: bool = False, error: str = "") -> None:
+        self.setup_panel.set_plan(plan, needs_source, pending=pending, error=error)
 
     def close_library_setup(self) -> None:
         self.track_stack.setCurrentWidget(self._track_list_page)
@@ -490,7 +507,8 @@ class MainWindow(QMainWindow):
 
     def _set_library_context_visible(self, visible: bool) -> None:
         self.library_header_info.setVisible(visible)
-        self.save_status.hide()
+        if not self._closing:
+            self.save_status.hide()
         self.overflow_button.setVisible(visible)
 
     def _show_library_state(self, title: str, detail: str = "") -> None:
@@ -505,7 +523,8 @@ class MainWindow(QMainWindow):
         self.library_title.clear()
         self.library_subtitle.clear()
         self.library_subtitle.setToolTip("")
-        self.save_status.clear()
+        if not self._closing:
+            self.save_status.clear()
         self.open_playlist_folder_button.setEnabled(False)
         self._current_library_id = ""
         self.authority_banner.hide()
@@ -562,9 +581,17 @@ class MainWindow(QMainWindow):
         self.authority_banner.show()
 
     def set_saving(self, saving: bool, message: str = "") -> None:
+        if self._closing:
+            return
         self.track_table.setEnabled(not saving and not self._audit_blocked)
         self.setup_panel.setEnabled(not saving)
-        self.save_status.setText("Saving..." if saving else message)
+        self.save_status.setText((message or "Saving...") if saving else message)
+
+    def set_closing_status(self, message: str = "Closing...") -> None:
+        self._closing = True
+        self.setEnabled(False)
+        self.save_status.setText(message)
+        self.save_status.show()
 
     def show_toast(self, text: str, action: str | bool | None = "undo") -> None:
 
@@ -630,7 +657,8 @@ class MainWindow(QMainWindow):
 
     def toggle_settings(self) -> None:
         self._settings_visible = not self._settings_visible
-        self.settings_toggle_button.setText("Hide settings" if self._settings_visible else "Show settings")
+        self.settings_toggle_button.setChecked(self._settings_visible)
+        self.settings_toggle_button.setToolTip("Hide settings" if self._settings_visible else "Show settings")
         self.settings_animation.stop()
         self.settings_animation.setStartValue(self.settings_container.width())
         self.settings_animation.setEndValue(self._settings_target_width() if self._settings_visible else 0)
@@ -670,24 +698,52 @@ class MainWindow(QMainWindow):
         self.themeModeChanged.emit("light" if self.theme_mode == "dark" else "dark")
 
     def set_pinned(self, pinned: bool) -> None:
-        self._window_pinned = bool(pinned)
-        self.pin_button.blockSignals(True)
+        pinned = bool(pinned)
+        signals_were_blocked = self.pin_button.blockSignals(True)
         self.pin_button.setChecked(pinned)
-        self.pin_button.blockSignals(False)
+        self.pin_button.blockSignals(signals_were_blocked)
+        if self._window_pinned == pinned:
+            self._refresh_pin_toggle_icon()
+            return
+        self._window_pinned = pinned
+        was_visible = self.isVisible()
+        window_state = self.windowState()
+        normal_geometry = self.normalGeometry()
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, pinned)
-        if self.isVisible():
-            self.show()
+        if was_visible:
+            self.setWindowState(Qt.WindowState.WindowNoState)
+            self.setGeometry(normal_geometry)
+            if window_state & Qt.WindowState.WindowFullScreen:
+                self.showFullScreen()
+            elif window_state & Qt.WindowState.WindowMaximized:
+                self.showMaximized()
+            else:
+                self.setWindowState(window_state)
+                self.show()
         self._refresh_pin_toggle_icon()
         self.pinChanged.emit(pinned)
 
     def apply_appearance(self, theme: ThemePalette, theme_mode: str, ui_scale_percent: int) -> None:
         self.theme, self.theme_mode, self.ui_scale_percent = theme, theme_mode, ui_scale_percent
         self.setMinimumSize(self._minimum_window_width(), 600)
-        self.setStyleSheet(build_stylesheet(theme, ui_scale_percent / 100))
-        icon_px = max(14, round(20 * ui_scale_percent / 100))
+        scale = ui_scale_percent / 100
+        self.setStyleSheet(build_stylesheet(theme, scale) + build_footer_stylesheet(theme, scale, theme_mode))
+        self._footer_layout.setContentsMargins(max(1, round(2 * scale)), 0, max(1, round(2 * scale)), 0)
+        self._footer_layout.setSpacing(max(4, round(8 * scale)))
+        icon_px = max(16, round(18 * scale))
         self.theme_button.setIconSize(QSize(icon_px, icon_px))
         self.pin_button.setIconSize(QSize(icon_px, icon_px))
-        self.overflow_button.setIconSize(QSize(icon_px, icon_px))
+        self.overflow_button.setIconSize(QSize(max(14, round(20 * scale)), max(14, round(20 * scale))))
+        accent = theme.accent_hover if theme_mode == "dark" else theme.accent
+        for button, name in (
+            (self.settings_toggle_button, "settings"),
+            (self.open_playlist_folder_button, "folder"),
+            (self.official_button, "website"),
+        ):
+            button.setIconSize(QSize(icon_px, icon_px))
+            button.setIcon(build_footer_icon(name, theme.text_primary, icon_px, checked_color=accent))
+        self.donate_button.setIconSize(QSize(icon_px, icon_px))
+        self.donate_button.setIcon(build_footer_icon("heart", accent, icon_px))
         self._refresh_theme_toggle_icon()
         self._refresh_pin_toggle_icon()
         self._refresh_playlist_actions_icon()

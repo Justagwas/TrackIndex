@@ -460,6 +460,7 @@ def build_import_plan(
         )
         for track_id in imported_ids
     )
+    provisional_paths = {str(track.path.resolve(strict=False)).casefold() for track in provisional}
     return replace(
         plan,
         renames=tuple(item for item in plan.renames if item.track_id not in imported_set),
@@ -467,7 +468,7 @@ def build_import_plan(
             snapshot
             for snapshot in plan.snapshots
             if str(snapshot.path.resolve(strict=False)).casefold()
-            not in {str(track.path.resolve(strict=False)).casefold() for track in provisional}
+            not in provisional_paths
         ),
         imports=imports,
     )
@@ -541,7 +542,8 @@ def build_session_change_plan(
     source_ids = {track_id for track_id, _name in source_pairs}
     target_names = dict(target_pairs)
     target_order = command.after_order if to_after else command.before_order
-    current_ids = set(audit.track_map())
+    track_map = audit.track_map()
+    current_ids = set(track_map)
     folded_targets: dict[str, str] = {}
     target_collisions: list[str] = []
     for target_name in target_names.values():
@@ -584,7 +586,13 @@ def build_session_change_plan(
     presence_by_id = {item.track_id: item for item in command.presence}
     operations: list[PresenceOperation] = []
     blockers = [*base.blockers, *target_collisions]
-    track_map = audit.track_map()
+    if audit.folder.resolve(strict=False) != command.folder.resolve(strict=False):
+        blockers.append("The session command belongs to a different library folder.")
+    if any(track_map[track_id].original_name != name for track_id, name in source_pairs):
+        blockers.append("Track filenames changed outside this session. Rescan before restoring.")
+    expected_playlist = command.before_playlist_bytes if to_after else command.after_playlist_bytes
+    if base.playlist_operations and base.playlist_operations[0].before_bytes != expected_playlist:
+        blockers.append("The playlist changed outside this session. Its edits were left untouched.")
     for track_id in source_ids - set(target_names):
         state = presence_by_id.get(track_id)
         track = track_map[track_id]
@@ -596,9 +604,10 @@ def build_session_change_plan(
                 track_id,
                 track.path,
                 recovery_path(audit.folder, command.command_id, state.recovery_name),
-                track.size,
+                state.size,
                 track.mtime_ns,
                 "stash",
+                state.sha256,
             )
         )
     for track_id in set(target_names) - source_ids:
@@ -669,7 +678,8 @@ def build_prefix_removal_plan(audit: AuditResult, playlist_target: Path) -> Chan
         track.original_name.casefold(): target_names[track.track_id]
         for track in audit.tracks
     }
-    ordered_names = tuple(audit.track_map()[track_id].original_name for track_id in audit.display_order)
+    track_map = audit.track_map()
+    ordered_names = tuple(track_map[track_id].original_name for track_id in audit.display_order)
     after = (
         render_playlist(document, ordered_names, final_by_original)
         if document.safe_to_rewrite

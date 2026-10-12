@@ -188,6 +188,7 @@ class LibraryList(QListWidget):
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.setDragEnabled(False)
         apply_media_crate_scrollbar(self.verticalScrollBar())

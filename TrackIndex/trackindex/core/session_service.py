@@ -15,9 +15,10 @@ from .config import (
     SUPPORTED_PLAYLIST_EXTENSIONS,
 )
 from .filesystem import is_link_like
+from .integrity import verify_content
 from .models import SessionCommand, SessionPresence, SessionRecoveryRecord, StorageMode
 from .paths import is_direct_child, sessions_dir
-from .presence import recovery_path
+from .presence import recovery_path, validate_recovery_ancestors
 from .recycle_service import recycle_files
 from .windows_names import is_valid_windows_name
 
@@ -148,6 +149,8 @@ def command_from_dict(payload: dict[str, object]) -> SessionCommand:
     raw_folder = str(payload.get("folder", "")).strip()
     if not raw_folder or not Path(raw_folder).is_absolute():
         raise ValueError("Session folder path is unsafe.")
+    if is_link_like(Path(raw_folder)):
+        raise ValueError("Session folder cannot use a link or junction.")
     folder = Path(raw_folder).resolve(strict=False)
     before_names = _pairs(payload.get("before_names", []), folder)
     after_names = _pairs(payload.get("after_names", []), folder)
@@ -223,12 +226,28 @@ def command_from_dict(payload: dict[str, object]) -> SessionCommand:
 class LibraryHistory:
     undo: list[SessionCommand] = field(default_factory=list)
     redo: list[SessionCommand] = field(default_factory=list)
+    persisted: bool = False
 
 
 class SessionManager:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or sessions_dir()
         self.histories: dict[str, LibraryHistory] = {}
+        self._protected_libraries: set[str] = set()
+        self._pending_commands: dict[str, str] = {}
+        self._recovery_scan_failed = False
+        if self.root.exists() and not is_link_like(self.root):
+            try:
+                self._protected_libraries.update(path.name for path in self.root.iterdir())
+            except OSError:
+                self._recovery_scan_failed = True
+
+    def protect_recovery(self, library_id: str) -> None:
+        self._protected_libraries.add(library_id)
+
+    def _finish_pending(self, library_id: str) -> None:
+        self._pending_commands.pop(library_id, None)
+        self._protected_libraries.discard(library_id)
 
     def history(self, library_id: str) -> LibraryHistory:
         return self.histories.setdefault(library_id, LibraryHistory())
@@ -271,11 +290,22 @@ class SessionManager:
             "pending_action": pending_action,
         }
         atomic_write_json(path, payload)
+        history.persisted = True
 
     def prepare(self, command: SessionCommand, action: str = "forward") -> None:
         if action not in {"forward", "undo", "redo"}:
             raise ValueError("Unknown session action.")
+        if self._recovery_scan_failed or command.library_id in self._protected_libraries:
+            raise ValueError("This library has pending recovery data. Resolve it before making more changes.")
+        self.protect_recovery(command.library_id)
+        self._pending_commands[command.library_id] = command.command_id
         self._write(command.library_id, pending=command, pending_action=action)
+
+    def abort(self, command: SessionCommand) -> None:
+        if self._pending_commands.get(command.library_id) != command.command_id:
+            return
+        self._write(command.library_id)
+        self._finish_pending(command.library_id)
 
     def commit_forward(self, command: SessionCommand) -> None:
         history = self.history(command.library_id)
@@ -291,6 +321,7 @@ class SessionManager:
             history.undo[:] = previous_undo
             history.redo[:] = previous_redo
             raise
+        self._finish_pending(command.library_id)
 
     def commit_undo(self, command: SessionCommand) -> None:
         history = self.history(command.library_id)
@@ -306,6 +337,7 @@ class SessionManager:
             history.undo[:] = previous_undo
             history.redo[:] = previous_redo
             raise
+        self._finish_pending(command.library_id)
 
     def commit_redo(self, command: SessionCommand) -> None:
         history = self.history(command.library_id)
@@ -321,6 +353,7 @@ class SessionManager:
             history.undo[:] = previous_undo
             history.redo[:] = previous_redo
             raise
+        self._finish_pending(command.library_id)
 
     def pending_recovery(self) -> tuple[SessionRecoveryRecord, ...]:
         if not self.root.exists() or is_link_like(self.root):
@@ -347,6 +380,8 @@ class SessionManager:
                 if not isinstance(payload, dict):
                     continue
                 schema_version = int(payload.get("schema_version", 0))
+                if schema_version < 0 or schema_version > 4:
+                    continue
                 redo_commands: list[SessionCommand] = []
                 unresolved_commands: list[SessionCommand] = []
                 if schema_version >= 3:
@@ -419,6 +454,15 @@ class SessionManager:
                 all_commands = tuple(
                     dict.fromkeys((*commands, *redo_commands, *unresolved_commands))
                 )
+                if not all_commands and pending is None and schema_version == 4:
+                    settled, orphan_commands = self._settled_empty_session(folder, payload)
+                    if settled:
+                        self.history(folder.name).persisted = True
+                        self._finish_pending(folder.name)
+                        continue
+                    if orphan_commands:
+                        all_commands = orphan_commands
+                        unresolved_commands.extend(orphan_commands)
                 if all_commands and any(
                     command.library_id != folder.name
                     or command.folder != all_commands[0].folder
@@ -438,6 +482,62 @@ class SessionManager:
             except (OSError, RuntimeError, ValueError, RecursionError, KeyError, TypeError):
                 continue
         return tuple(records)
+
+    def _settled_empty_session(
+        self, folder: Path, payload: dict[str, object]
+    ) -> tuple[bool, tuple[SessionCommand, ...]]:
+        expected_fields = {
+            "schema_version", "accepted", "command_ids", "undo_ids", "redo_ids",
+            "pending_id", "pending_action",
+        }
+        if (
+            set(payload) != expected_fields
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != 4
+            or type(payload["accepted"]) is not bool
+            or any(payload[key] != [] for key in ("command_ids", "undo_ids", "redo_ids"))
+            or payload["pending_id"] is not None
+            or payload["pending_action"] != ""
+        ):
+            return False, ()
+        entries = tuple(folder.iterdir())
+        if any(is_link_like(path) or path.name not in {"session.json", "commands"} for path in entries):
+            return False, ()
+        commands_folder = folder / "commands"
+        if not commands_folder.exists():
+            return False, ()
+        if not commands_folder.is_dir():
+            return False, ()
+        paths = tuple(commands_folder.iterdir())
+        if any(
+            is_link_like(path) or not path.is_file() or path.suffix != ".json"
+            or not _SAFE_ID.fullmatch(path.stem)
+            for path in paths
+        ):
+            return False, ()
+        commands = tuple(self._read_command(folder.name, path.stem) for path in paths)
+        if not commands:
+            return False, ()
+        library_folder = commands[0].folder
+        if any(command.folder != library_folder for command in commands):
+            return False, ()
+        recovery = library_folder / SESSION_RECOVERY_FOLDER
+        if is_link_like(library_folder) or not library_folder.is_dir() or is_link_like(recovery):
+            return False, commands
+        if not recovery.exists():
+            return True, ()
+        if not recovery.is_dir():
+            return False, commands
+        owned_ids = {command.command_id for command in commands}
+        for command_folder in recovery.iterdir():
+            if (
+                command_folder.name not in owned_ids
+                or is_link_like(command_folder)
+                or not command_folder.is_dir()
+                or any(command_folder.iterdir())
+            ):
+                return False, commands
+        return True, ()
 
     def _read_command(self, library_id: str, command_id: str) -> SessionCommand:
         path = self._command_path(library_id, command_id)
@@ -462,6 +562,16 @@ class SessionManager:
 
     @staticmethod
     def _command_disk_state(command: SessionCommand) -> str:
+        if is_link_like(command.folder) or not command.folder.is_dir():
+            return "unknown"
+        if any(
+            not validate_recovery_ancestors(
+                recovery_path(command.folder, command.command_id, state.recovery_name),
+                command.folder,
+            )
+            for state in command.presence
+        ):
+            return "unknown"
         before_ids = {track_id for track_id, _name in command.before_names}
         after_ids = {track_id for track_id, _name in command.after_names}
         presence = {item.track_id: item for item in command.presence}
@@ -543,53 +653,163 @@ class SessionManager:
             return "unknown"
         return "unknown"
 
-    def keep_recovery(self, library_id: str) -> None:
+    def keep_recovery(self, library_id: str) -> bool:
         if not _SAFE_ID.fullmatch(library_id):
-            return
+            return False
         folder = self.root / library_id
         if self._finalize_presence(folder):
             self._remove_tree(folder)
+            if not folder.exists():
+                self._finish_pending(library_id)
+                self.histories.pop(library_id, None)
+                return True
+        return False
 
     def accept_all(self) -> None:
-        if not self.root.exists() or is_link_like(self.root):
+        if self._recovery_scan_failed or not self.root.exists() or is_link_like(self.root):
             return
         try:
             children = tuple(self.root.iterdir())
         except OSError:
             return
-        for child in children:
-            if child.is_dir() and self._finalize_presence(child):
-                self._remove_tree(child)
+        self.accept_libraries(tuple(child.name for child in children
+            if child.name in self.histories and child.name not in self._protected_libraries))
 
-    def _finalize_presence(self, session_folder: Path) -> bool:
+    def acceptance_ids(self) -> tuple[str, ...]:
+        if self._recovery_scan_failed:
+            return ()
+        return tuple(
+            key for key, history in self.histories.items()
+            if key not in self._protected_libraries
+            and (history.persisted or history.undo or history.redo)
+        )
+
+    def accept_libraries(self, library_ids: tuple[str, ...], stop_requested=None, *, finalize: bool = True) -> tuple[str, ...]:
+        library_ids = tuple(dict.fromkeys(library_ids))
+        candidates: dict[Path, tuple[int, str]] = {}
+        for library_id in library_ids:
+            if stop_requested is not None and stop_requested():
+                return ()
+            if not _SAFE_ID.fullmatch(library_id) or not self._finalize_presence(self.root / library_id, candidates):
+                return ()
+        try:
+            for path, (size, digest) in candidates.items():
+                if stop_requested is not None and stop_requested():
+                    return ()
+                verify_content(path, size, digest)
+            if stop_requested is not None and stop_requested():
+                return ()
+            if candidates and (recycle_files(tuple(candidates)) or any(path.exists() for path in candidates)):
+                return ()
+            if stop_requested is not None and stop_requested():
+                return ()
+        except (OSError, RuntimeError, ValueError):
+            return ()
+        if not finalize:
+            return library_ids
+        accepted = []
+        for library_id in library_ids:
+            if self.keep_recovery(library_id):
+                accepted.append(library_id)
+        return tuple(accepted)
+
+    def _finalize_presence(self, session_folder: Path, collect: dict[Path, tuple[int, str]] | None = None) -> bool:
 
 
         commands_folder = session_folder / "commands"
-        if not commands_folder.is_dir() or is_link_like(commands_folder):
-            return True
+        if any(is_link_like(path) for path in (self.root, session_folder, commands_folder)):
+            return False
+        try:
+            if any(
+                is_link_like(path) or path.name not in {"session.json", "commands"}
+                for path in session_folder.iterdir()
+            ):
+                return False
+        except OSError:
+            return False
+        if not commands_folder.is_dir():
+            return not commands_folder.exists()
         commands: list[SessionCommand] = []
         try:
-            paths = tuple(commands_folder.glob("*.json"))
+            paths = tuple(commands_folder.iterdir())
         except OSError:
             return False
         for path in paths:
+            if is_link_like(path) or not path.is_file() or path.suffix != ".json":
+                return False
             try:
                 command = self._read_command(session_folder.name, path.stem)
             except (OSError, RuntimeError, ValueError, TypeError, KeyError, RecursionError):
                 return False
             commands.append(command)
+        storage_owners: dict[Path, set[str]] = {}
+        for command in commands:
+            storage_owners.setdefault(command.folder, set()).add(command.command_id)
+        for library_folder, command_ids in storage_owners.items():
+            root = library_folder / SESSION_RECOVERY_FOLDER
+            if is_link_like(root):
+                return False
+            if root.exists():
+                try:
+                    if not root.is_dir() or any(
+                        path.name not in command_ids or is_link_like(path) or not path.is_dir()
+                        for path in root.iterdir()
+                    ):
+                        return False
+                except OSError:
+                    return False
+        for command in commands:
+            probe = recovery_path(command.folder, command.command_id, "ownership.wav")
+            if not validate_recovery_ancestors(probe, command.folder):
+                return False
+            command_folder = probe.parent
+            if command_folder.exists():
+                expected_names = {state.recovery_name for state in command.presence}
+                try:
+                    if any(path.name not in expected_names for path in command_folder.iterdir()):
+                        return False
+                except OSError:
+                    return False
         expected_paths = tuple(
             recovery_path(command.folder, command.command_id, state.recovery_name)
             for command in commands
             for state in command.presence
         )
         if any(
+            not validate_recovery_ancestors(
+                recovery_path(command.folder, command.command_id, state.recovery_name),
+                command.folder,
+            )
+            for command in commands
+            for state in command.presence
+        ):
+            return False
+        if any(
             path.exists() and (not path.is_file() or is_link_like(path))
             for path in expected_paths
         ):
             return False
         recovery_files = tuple(path for path in expected_paths if path.exists())
-        if recycle_files(recovery_files):
+        evidence: dict[Path, tuple[int, str]] = {}
+        try:
+            for command in commands:
+                for state in command.presence:
+                    path = recovery_path(command.folder, command.command_id, state.recovery_name)
+                    expected = (state.size, state.sha256)
+                    if path in evidence and evidence[path] != expected:
+                        return False
+                    if path.exists():
+                        verify_content(path, *expected)
+                        evidence[path] = expected
+            if collect is not None:
+                for path, expected in evidence.items():
+                    if path in collect and collect[path] != expected:
+                        return False
+                collect.update(evidence)
+                return True
+            if recovery_files and (recycle_files(tuple(evidence)) or any(path.exists() for path in evidence)):
+                return False
+        except (OSError, RuntimeError, ValueError):
             return False
         for command in commands:
             command_folder = (
@@ -597,9 +817,17 @@ class SessionManager:
             )
             try:
                 command_folder.rmdir()
-                command_folder.parent.rmdir()
-            except OSError:
+            except FileNotFoundError:
                 pass
+            except OSError:
+                return False
+        for library_folder in storage_owners:
+            try:
+                (library_folder / SESSION_RECOVERY_FOLDER).rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
         return True
 
     @staticmethod

@@ -116,14 +116,14 @@ def _first(tags: _TagMapping | None, *keys: str) -> str:
 
 
 def _embedded_art(audio: object) -> bytes | None:
-    tags = getattr(audio, "tags", None)
-    if tags is None:
-        return None
     try:
         pictures = getattr(audio, "pictures", None)
         if pictures:
             data = bytes(pictures[0].data)
             return data if len(data) <= _MAX_ARTWORK_BYTES else None
+        tags = getattr(audio, "tags", None)
+        if tags is None:
+            return None
         for value in tags.values():
             embedded_data = getattr(value, "data", None)
             if embedded_data and value.__class__.__name__.upper().startswith("APIC"):

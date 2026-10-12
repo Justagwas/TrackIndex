@@ -10,6 +10,7 @@ _RESERVED_WINDOWS_STEMS = {
     "nul",
     *(f"com{index}" for index in range(1, 10)),
     *(f"lpt{index}" for index in range(1, 10)),
+    *(f"{prefix}{index}" for prefix in ("com", "lpt") for index in ("\u00b9", "\u00b2", "\u00b3")),
 }
 
 

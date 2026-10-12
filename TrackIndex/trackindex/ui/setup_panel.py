@@ -444,11 +444,12 @@ class LibrarySetupPanel(QWidget):
             button.set_scale(scale)
         self._schedule_card_height()
 
-    def set_plan(self, plan: ChangePlan | None, needs_source: bool = False) -> None:
+    def set_plan(self, plan: ChangePlan | None, needs_source: bool = False, *, pending: bool = False, error: str = "") -> None:
         if plan is None:
-            self.impact.setText("Select a starting order before TrackIndex can prepare the changes.")
-            self.issues.setText("Filename and playlist orders disagree. Choose which order to use.")
-            self.issues_scroll.setVisible(needs_source)
+            self.impact.setText("Preparing changes..." if pending else "Changes could not be prepared." if error
+                                else "Select a starting order before TrackIndex can prepare the changes.")
+            self.issues.setText(error or "Filename and playlist orders disagree. Choose which order to use.")
+            self.issues_scroll.setVisible(bool(error) or needs_source)
             self.submit_button.setEnabled(False)
             self._schedule_card_height()
             return

@@ -33,10 +33,6 @@ def recovery_dir() -> Path:
     return product_data_dir() / "recovery"
 
 
-def updates_dir() -> Path:
-    return product_data_dir() / "updates"
-
-
 def sessions_dir() -> Path:
     return product_data_dir() / "sessions"
 
@@ -51,3 +47,15 @@ def is_direct_child(path: Path, folder: Path, *, suffix: str | None = None) -> b
     if resolved_path.parent != resolved_folder:
         return False
     return suffix is None or resolved_path.suffix.casefold() == suffix.casefold()
+
+
+def _is_direct_child_of_resolved_folder(
+    path: Path, resolved_folder: Path, *, suffix: str | None = None,
+) -> bool:
+    try:
+        resolved_path = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+    return resolved_path.parent == resolved_folder and (
+        suffix is None or resolved_path.suffix.casefold() == suffix.casefold()
+    )

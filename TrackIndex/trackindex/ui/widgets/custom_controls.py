@@ -24,6 +24,8 @@ class RoundHandleSliderStyle(QProxyStyle):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__()
+        if parent is not None:
+            self.setParent(parent)
         self._handle_color = QColor(handle_color)
         self._border_color = QColor(border_color)
         self._groove_color = QColor(groove_color)

@@ -83,16 +83,14 @@ QPushButton#footerLink {{ background: transparent; color: {theme.accent}; border
 QPushButton#footerLink:hover {{ color: {theme.text_primary}; background: transparent; }}
 QPushButton#footerIcon {{ background: transparent; color: {theme.text_primary}; border: none; min-width: {px(22)}px; min-height: {px(22)}px; max-width: {px(22)}px; max-height: {px(22)}px; padding: 0; margin: 0; }}
 QPushButton#footerIcon:hover {{ background: transparent; }}
-QPushButton#playerIconButton {{ background: transparent; border: none; border-radius: {px(13)}px; padding: 0; min-width: {px(26)}px; min-height: {px(26)}px; max-width: {px(26)}px; max-height: {px(26)}px; }}
-QPushButton#playerIconButton:hover {{ background: {theme.disabled_bg}; border: none; }}
-QPushButton#playerIconButton:checked {{ background: transparent; border: none; }}
-QPushButton#playerIconButton:checked:hover {{ background: {theme.disabled_bg}; border: none; }}
-QPushButton#playerPrimaryButton {{ background: {theme.accent}; border: none; border-radius: {px(19)}px; padding: 0; min-width: {px(38)}px; min-height: {px(38)}px; max-width: {px(38)}px; max-height: {px(38)}px; }}
-QPushButton#playerPrimaryButton:hover {{ background: {theme.accent_hover}; border: none; }}
-QPushButton#playerMiniPrimaryButton {{ background: {theme.accent}; border: none; border-radius: {px(16)}px; padding: 0; min-width: {px(32)}px; min-height: {px(32)}px; max-width: {px(32)}px; max-height: {px(32)}px; }}
-QPushButton#playerMiniPrimaryButton:hover {{ background: {theme.accent_hover}; border: none; }}
-QPushButton#playerUtilityButton {{ background: transparent; border: none; border-radius: {px(13)}px; padding: 0; }}
-QPushButton#playerUtilityButton:hover {{ background: {theme.disabled_bg}; border: none; }}
+QFrame#playerPanel QPushButton {{ background: transparent; border: 1px solid transparent; border-radius: {px(6)}px; padding: 0; margin: 0; }}
+QFrame#playerPanel QPushButton:hover {{ background: {theme.app_bg}; border-color: transparent; }}
+QFrame#playerPanel QPushButton[keyboardFocus="true"]:focus {{ border-color: {theme.text_secondary}; }}
+QFrame#playerPanel QPushButton:pressed {{ background: {theme.disabled_bg}; }}
+QFrame#playerPanel QPushButton:disabled {{ background: transparent; border-color: transparent; }}
+QPushButton#playerIconButton {{ min-width: {px(30)}px; min-height: {px(30)}px; max-width: {px(30)}px; max-height: {px(30)}px; }}
+QPushButton#playerPrimaryButton {{ min-width: {px(38)}px; min-height: {px(38)}px; max-width: {px(38)}px; max-height: {px(38)}px; }}
+QPushButton#playerMiniPrimaryButton {{ min-width: {px(32)}px; min-height: {px(32)}px; max-width: {px(32)}px; max-height: {px(32)}px; }}
 QLabel#playerTrackTitle {{ color: {theme.text_primary}; font: 700 {pt(9.4):.1f}pt "Segoe UI"; padding: 0; }}
 QLabel#playerTrackTitle:hover {{ color: {theme.accent_hover}; }}
 QLabel#playerTrackMetadata {{ color: {theme.text_secondary}; font: 600 {pt(8.0):.1f}pt "Segoe UI"; padding: 0; }}

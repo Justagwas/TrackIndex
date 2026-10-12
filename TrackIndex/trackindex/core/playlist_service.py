@@ -106,7 +106,13 @@ def parse_playlist(path: Path, folder: Path, available_names: dict[str, str]) ->
                 text = raw.decode(encoding)
             except (LookupError, UnicodeDecodeError):
                 encoding = "cp1252"
-                text = raw.decode(encoding)
+                try:
+                    text = raw.decode(encoding)
+                except UnicodeDecodeError:
+                    return PlaylistDocument(
+                        path, raw, bom, newline, ("#EXTM3U",), (), (),
+                        (f"{path.name} could not be decoded safely.",), False, encoding,
+                    )
         else:
             text = raw.decode("utf-8-sig", errors="replace")
             errors.append(f"{path.name} is not valid UTF-8.")

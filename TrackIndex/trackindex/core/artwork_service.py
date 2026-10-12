@@ -29,7 +29,7 @@ class ArtworkStore:
         self.max_entries = max(1, int(max_entries))
         self.max_bytes = max(1024, int(max_bytes))
         self._values: OrderedDict[str, bytes] = OrderedDict()
-        self._failed: set[str] = set()
+        self._failed: OrderedDict[str, None] = OrderedDict()
         self._inflight: dict[str, Event] = {}
         self._bytes = 0
         self._decode_count = 0
@@ -65,6 +65,7 @@ class ArtworkStore:
                 self._values.move_to_end(key)
                 return PreparedArtwork(key, cached)
             if key in self._failed:
+                self._failed.move_to_end(key)
                 return None
             ready = self._inflight.get(key)
             prepare_here = ready is None
@@ -92,7 +93,10 @@ class ArtworkStore:
 
         with self._lock:
             if not thumbnail:
-                self._failed.add(key)
+                self._failed[key] = None
+                self._failed.move_to_end(key)
+                while len(self._failed) > self.max_entries:
+                    self._failed.popitem(last=False)
                 result = None
             else:
                 self._values[key] = thumbnail

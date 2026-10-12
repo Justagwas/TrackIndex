@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from math import isfinite
 from pathlib import Path
 from time import monotonic
@@ -10,7 +10,7 @@ from typing import Protocol
 
 from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QLineEdit, QPlainTextEdit, QTextEdit
+from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QLineEdit, QPlainTextEdit, QTextEdit, QWidget
 
 from trackindex.core.config import SUPPORTED_AUDIO_EXTENSIONS
 from trackindex.core.config_service import AppConfig, save_config
@@ -38,6 +38,14 @@ from trackindex.ui.main_window import MainWindow
 from .system_media import MediaContext, MediaPublication, SystemMediaBridge
 
 _LOG = diagnostics_logger("playback")
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingPosition:
+    generation: int
+    library_id: str
+    track_id: str
+    seconds: float
 
 
 class PlaybackLibraryCoordinator(Protocol):
@@ -78,6 +86,8 @@ class PlaybackWorker(QObject):
             return
         generation = 0
         try:
+            if command == "load" and isinstance(value, (tuple, list)) and len(value) == 3:
+                generation = int(value[2])
             generation = self._execute_command(command, value)
         except Exception as exc:
             _LOG.exception("Playback backend command failed: %s", command)
@@ -201,7 +211,7 @@ class PlaybackController(QObject):
         config: AppConfig,
         backend: PlaybackBackend | None = None,
     ) -> None:
-        super().__init__(window)
+        super().__init__(app)
         self.app = app
         self.window = window
         self.app_controller = app_controller
@@ -249,14 +259,14 @@ class PlaybackController(QObject):
         self._config_timer.setSingleShot(True)
         self._config_timer.setInterval(250)
         self._config_timer.timeout.connect(self._save_preferences)
-        self._pending_position: float | None = None
+        self._pending_position: _PendingPosition | None = None
         self._position_event_timer = QTimer(self)
         self._position_event_timer.setSingleShot(True)
         self._position_event_timer.setInterval(50)
         self._position_event_timer.timeout.connect(self._flush_backend_position)
         self._shortcuts: list[QShortcut] = []
         self._media_shortcuts: list[QShortcut] = []
-        self._playback_thread = QThread(window)
+        self._playback_thread = QThread(self)
         self.worker = PlaybackWorker(backend)
         self.worker.moveToThread(self._playback_thread)
         self._playback_thread.started.connect(self.worker.start)
@@ -352,8 +362,8 @@ class PlaybackController(QObject):
         self._shortcuts.append(space)
         panel = self.window.player_panel
         for button, hint in (
-            (panel.play_button, "Play or pause (Ctrl+Space)"),
-            (panel.mini_play_button, "Play or pause (Ctrl+Space)"),
+            (panel.play_button, "Play or pause (Space / Ctrl+Space)"),
+            (panel.mini_play_button, "Play or pause (Space / Ctrl+Space)"),
             (panel.previous_button, "Previous (Ctrl+Left)"),
             (panel.mini_previous_button, "Previous (Ctrl+Left)"),
             (panel.next_button, "Next (Ctrl+Right)"),
@@ -377,6 +387,22 @@ class PlaybackController(QObject):
             self.dispatch_transport(command)
 
     def eventFilter(self, watched, event) -> bool:
+        if (
+            event.type() in {QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress, QEvent.Type.KeyRelease}
+            and event.key() == Qt.Key.Key_Space
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and isinstance(watched, QWidget)
+            and watched.window() is self.window
+            and self.snapshot.entry is not None
+            and self.snapshot.presentation is not PlayerPresentation.HIDDEN
+            and not isinstance(self.app.focusWidget(), (QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox))
+            and self.app.activeModalWidget() is None
+            and self.app.activePopupWidget() is None
+        ):
+            event.accept()
+            if event.type() == QEvent.Type.KeyPress and not event.isAutoRepeat():
+                self.dispatch_transport("toggle")
+            return True
         if (
             event.type() == QEvent.Type.ShortcutOverride
             and isinstance(watched, (QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox))
@@ -500,6 +526,7 @@ class PlaybackController(QObject):
         return entry.path.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS
 
     def _load_entry(self, entry: QueueEntry, *, paused: bool = False) -> None:
+        self._clear_pending_position()
         self._intentional_stop = False
         self._awaiting_prefetched_load = False
         self._ignore_ended_until_loaded = True
@@ -566,6 +593,7 @@ class PlaybackController(QObject):
         self._load_entry(entry, paused=paused)
 
     def _adopt_prefetched_entry(self, entry: QueueEntry, *, paused: bool = False) -> None:
+        self._clear_pending_position()
         self._backend_lookahead_id = ""
         self._active_backend_generation = self._backend_lookahead_generation
         self._backend_lookahead_generation = 0
@@ -598,6 +626,7 @@ class PlaybackController(QObject):
 
     @Slot()
     def stop(self) -> None:
+        self._clear_pending_position()
         if self.snapshot.entry is None:
             return
         entry = self.snapshot.entry
@@ -623,6 +652,7 @@ class PlaybackController(QObject):
 
     @Slot()
     def close(self) -> None:
+        self._clear_pending_position()
         self._intentional_stop = True
         self._awaiting_prefetched_load = False
         self._backend_lookahead_id = ""
@@ -657,6 +687,7 @@ class PlaybackController(QObject):
         value = max(0.0, converted)
         if self.snapshot.duration_seconds is not None:
             value = min(value, self.snapshot.duration_seconds)
+        self._clear_pending_position()
         self.snapshot = replace(self.snapshot, position_seconds=value)
         self.window.player_panel.set_snapshot(self.snapshot)
         self.commandRequested.emit("seek", value)
@@ -865,6 +896,10 @@ class PlaybackController(QObject):
         return True
 
     def _event_loaded(self, _value: object) -> bool:
+        entry = self.snapshot.entry
+        restored = entry is not None and entry.track_id in self.queue.unavailable
+        if entry is not None:
+            self.queue.mark_available(entry.track_id)
         self._ignore_ended_until_loaded = False
         state = PlaybackState.PLAYING if self._play_after_load else PlaybackState.PAUSED
         self.snapshot = replace(self.snapshot, state=state, loading=False)
@@ -875,11 +910,12 @@ class PlaybackController(QObject):
         self._output_recovery_message = ""
         self.commandRequested.emit("pause", not self._play_after_load)
         if self._seek_after_load is not None:
+            self._clear_pending_position()
             position = self._seek_after_load
             self._seek_after_load = None
             self.snapshot = replace(self.snapshot, position_seconds=position)
             self.commandRequested.emit("seek", position)
-        if self._awaiting_prefetched_load:
+        if self._awaiting_prefetched_load or restored:
             self._awaiting_prefetched_load = False
             self._refresh_lookahead()
         return True
@@ -893,9 +929,15 @@ class PlaybackController(QObject):
 
     def _event_position(self, value: object) -> bool:
         pending_position = _finite_float(value)
-        if pending_position is None:
+        entry = self.snapshot.entry
+        if pending_position is None or entry is None or self.snapshot.state in {
+            PlaybackState.IDLE, PlaybackState.STOPPED, PlaybackState.ERROR,
+        }:
             return False
-        self._pending_position = max(0.0, pending_position)
+        self._pending_position = _PendingPosition(
+            self._active_backend_generation, entry.library_id, entry.track_id,
+            max(0.0, pending_position),
+        )
         if not self._position_event_timer.isActive():
             self._position_event_timer.start()
         return False
@@ -975,13 +1017,23 @@ class PlaybackController(QObject):
                 self.snapshot.state is PlaybackState.PLAYING,
             )
 
-    def _flush_backend_position(self) -> None:
-        value = self._pending_position
+    def _clear_pending_position(self) -> None:
+        self._position_event_timer.stop()
         self._pending_position = None
-        if value is None or self._stopping:
+
+    def _flush_backend_position(self) -> None:
+        pending = self._pending_position
+        self._pending_position = None
+        entry = self.snapshot.entry
+        if (
+            pending is None or self._stopping or entry is None
+            or pending.generation != self._active_backend_generation
+            or (pending.library_id, pending.track_id) != (entry.library_id, entry.track_id)
+            or self.snapshot.state in {PlaybackState.IDLE, PlaybackState.STOPPED, PlaybackState.ERROR}
+        ):
             return
-        self.snapshot = replace(self.snapshot, position_seconds=value)
-        self.window.player_panel.set_position(value)
+        self.snapshot = replace(self.snapshot, position_seconds=pending.seconds)
+        self.window.player_panel.set_position(pending.seconds)
 
     def _replace_current_source(self, source: SourceAudioInfo) -> None:
         entry = self.snapshot.entry
@@ -1105,6 +1157,7 @@ class PlaybackController(QObject):
             self._mutation_active and self.queue.current_id in departing
         )
         if self._mutation_unloaded_current:
+            self._clear_pending_position()
             self._intentional_stop = True
             self._backend_lookahead_id = ""
             self._backend_lookahead_generation = 0
@@ -1228,21 +1281,21 @@ class PlaybackController(QObject):
         for shortcut in self._shortcuts:
             shortcut.setEnabled(False)
         self._config_timer.stop()
-        self._position_event_timer.stop()
-        self._pending_position = None
+        self._clear_pending_position()
         if self._system_media is not None:
             self._system_media.close()
         self.window.player_panel.set_presentation(PlayerPresentation.HIDDEN)
         self.commandRequested.emit("shutdown", None)
-        if not self._playback_thread.wait(5000):
-            _LOG.error("Playback backend did not stop before the shutdown deadline")
-            self._playback_thread.quit()
-            if not self._playback_thread.wait(1000):
-                _LOG.error("Playback thread remained active after its final shutdown deadline")
+    def shutdown_drained(self) -> bool:
+        return self._playback_thread.wait(0)
+
+    def persist_shutdown_state(self) -> bool:
         try:
             save_config(self.config)
         except (OSError, ValueError):
             _LOG.exception("Playback preferences could not be saved during shutdown")
+            return False
+        return True
 
 
 def _bit_depth(sample_format: str) -> int | None:

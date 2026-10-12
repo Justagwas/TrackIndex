@@ -28,7 +28,7 @@ from .config import (
     UPDATE_SETUP_FALLBACK_URL,
 )
 from .filesystem import is_link_like
-from .paths import app_dir, updates_dir
+from .paths import app_dir, product_data_dir
 
 _ALLOWED_HOSTS = {
     "justagwas.com",
@@ -39,6 +39,8 @@ _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_INSTALLER_BYTES = 512 * 1024 * 1024
+_UPDATE_STAGING_RE = re.compile(r"^trackindex-update-[0-9a-f]{32}$")
+_UPDATE_FILES = ("TrackIndexSetup.exe", "TrackIndexSetup.exe.tmp")
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,7 +295,9 @@ def prepare_update(
         or not 0 < check.setup_size <= _MAX_INSTALLER_BYTES
     ):
         raise RuntimeError("Update verification metadata is invalid.")
-    staging_root = updates_dir()
+    staging_root = product_data_dir()
+    if is_link_like(staging_root):
+        raise RuntimeError("Update staging cannot use a link or junction.")
     staging_root.mkdir(parents=True, exist_ok=True)
     if is_link_like(staging_root):
         raise RuntimeError("Update staging cannot use a link or junction.")
@@ -341,10 +345,7 @@ def prepare_update(
             _installer_mode() == "/ALLUSERS",
         )
     except Exception:
-        temporary.unlink(missing_ok=True)
-        target.unlink(missing_ok=True)
-        with suppress(OSError):
-            root.rmdir()
+        _remove_staged_update(root, staging_root)
         raise
 
 
@@ -354,7 +355,7 @@ def launch_prepared_update(prepared: PreparedUpdate, *, restart_after_update: bo
         or not 0 < prepared.setup_size <= _MAX_INSTALLER_BYTES
     ):
         raise RuntimeError("Prepared update verification metadata is invalid.")
-    raw_staging_root = updates_dir()
+    raw_staging_root = product_data_dir()
     raw_update_root = prepared.setup_path.parent
     raw_setup_path = prepared.setup_path
     if (
@@ -372,7 +373,7 @@ def launch_prepared_update(prepared: PreparedUpdate, *, restart_after_update: bo
         raise RuntimeError(f"Prepared update is unavailable: {exc}") from exc
     if (
         update_root.parent != staging_root
-        or not update_root.name.startswith("trackindex-update-")
+        or not _UPDATE_STAGING_RE.fullmatch(update_root.name.casefold())
         or setup_path.parent != update_root
         or setup_path.name != "TrackIndexSetup.exe"
         or not setup_path.is_file()
@@ -418,49 +419,54 @@ def launch_prepared_update(prepared: PreparedUpdate, *, restart_after_update: bo
 
 
 def discard_prepared_update(prepared: PreparedUpdate) -> None:
-    raw_staging_root = updates_dir()
-    raw_update_root = prepared.setup_path.parent
+    if prepared.setup_path.name != "TrackIndexSetup.exe":
+        return
+    _remove_staged_update(prepared.setup_path.parent, product_data_dir())
+
+
+def _remove_staged_update(folder: Path, storage: Path) -> None:
     if (
-        prepared.setup_path.name != "TrackIndexSetup.exe"
-        or is_link_like(raw_staging_root)
-        or is_link_like(raw_update_root)
-        or is_link_like(prepared.setup_path)
+        not _UPDATE_STAGING_RE.fullmatch(folder.name.casefold())
+        or is_link_like(storage)
+        or is_link_like(folder)
     ):
         return
     try:
-        staging_root = raw_staging_root.resolve(strict=True)
-        update_root = raw_update_root.resolve(strict=True)
-    except OSError:
-        return
-    if (
-        update_root.parent != staging_root
-        or not update_root.name.startswith("trackindex-update-")
-        or is_link_like(update_root)
-    ):
-        return
-    try:
-        for child in update_root.iterdir():
-            if child.is_file() or child.is_symlink():
+        if folder.resolve(strict=True).parent != storage.resolve(strict=True) or not folder.is_dir():
+            return
+        for name in _UPDATE_FILES:
+            child = folder / name
+            if not is_link_like(child) and child.is_file():
                 child.unlink(missing_ok=True)
-        update_root.rmdir()
-    except OSError:
+        folder.rmdir()
+    except (OSError, RuntimeError):
         return
 
 
-def cleanup_old_update_staging(max_age_days: int = 7) -> None:
-    root = updates_dir()
+def cleanup_old_update_staging(max_age_days: int = 1) -> None:
+    root = product_data_dir()
     if not root.exists() or is_link_like(root):
         return
     threshold = time.time() - max_age_days * 86400
-    for child in root.glob("trackindex-update-*"):
+    for storage in (root, root / "updates"):
+        if is_link_like(storage) or not storage.is_dir():
+            continue
         try:
-            if is_link_like(child) or not child.is_dir():
-                continue
-            if child.stat().st_mtime >= threshold:
-                continue
-            for file_path in child.iterdir():
-                if file_path.is_file() or file_path.is_symlink():
-                    file_path.unlink(missing_ok=True)
-            child.rmdir()
+            children = tuple(storage.iterdir())
         except OSError:
             continue
+        for child in children:
+            try:
+                if (
+                    not _UPDATE_STAGING_RE.fullmatch(child.name.casefold())
+                    or is_link_like(child)
+                    or not child.is_dir()
+                    or child.stat().st_mtime >= threshold
+                ):
+                    continue
+                _remove_staged_update(child, storage)
+            except OSError:
+                continue
+        if storage != root:
+            with suppress(OSError):
+                storage.rmdir()

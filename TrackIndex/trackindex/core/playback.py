@@ -138,6 +138,9 @@ class PlaybackQueue:
         if self.shuffle and mode is RepeatMode.ALL and not self._future:
             self._rebuild_shuffle_cycle()
 
+    def mark_available(self, track_id: str) -> None:
+        self.unavailable.discard(track_id)
+
     def mark_unavailable(self, track_id: str) -> None:
         self.unavailable.add(track_id)
         self.history = [item for item in self.history if item != track_id]
@@ -154,7 +157,9 @@ class PlaybackQueue:
                 return candidate
             if self.repeat is RepeatMode.ALL:
                 self._rebuild_shuffle_cycle()
-                return self._future[0] if self._future else ""
+                if self._future:
+                    return self._future[0]
+                return self.current_id if self.current_id not in self.unavailable else ""
             return ""
         ids = [entry.track_id for entry in self.entries]
         try:

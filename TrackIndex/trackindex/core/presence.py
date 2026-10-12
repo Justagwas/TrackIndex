@@ -25,11 +25,11 @@ def recovery_path(folder: Path, command_id: str, name: str) -> Path:
 
 
 def is_recovery_path(path: Path, folder: Path) -> bool:
-    candidate = path.resolve(strict=False)
-    root = (folder / SESSION_RECOVERY_FOLDER).resolve(strict=False)
+    if ".." in path.parts:
+        return False
     try:
-        relative = candidate.relative_to(root)
-    except ValueError:
+        relative = path.absolute().relative_to((folder / SESSION_RECOVERY_FOLDER).absolute())
+    except (OSError, RuntimeError, ValueError):
         return False
     return (
         len(relative.parts) == 2
@@ -44,7 +44,19 @@ def validate_recovery_ancestors(path: Path, folder: Path) -> bool:
         return False
     root = folder / SESSION_RECOVERY_FOLDER
     command = path.parent
-    return not any(candidate.exists() and is_link_like(candidate) for candidate in (root, command))
+    if any(is_link_like(candidate) for candidate in (folder, root, command, path)):
+        return False
+    try:
+        if not folder.is_dir() or any(
+            candidate.exists() and not candidate.is_dir() for candidate in (root, command)
+        ):
+            return False
+        if path.exists() and not path.is_file():
+            return False
+        expected_parent = folder.resolve(strict=False) / SESSION_RECOVERY_FOLDER / command.name
+        return path.resolve(strict=False).parent == expected_parent
+    except (OSError, RuntimeError):
+        return False
 
 
 def ensure_recovery_parent(path: Path, folder: Path) -> None:
@@ -53,6 +65,8 @@ def ensure_recovery_parent(path: Path, folder: Path) -> None:
     root = folder / SESSION_RECOVERY_FOLDER
     root.mkdir(exist_ok=True)
     path.parent.mkdir(exist_ok=True)
+    if not validate_recovery_ancestors(path, folder):
+        raise OSError("Recovery storage became unsafe.")
     if os.name == "nt":
         import ctypes
 

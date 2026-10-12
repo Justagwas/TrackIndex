@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
@@ -17,6 +18,7 @@ from .config import (
     SUPPORTED_PLAYLIST_EXTENSIONS,
 )
 from .filesystem import is_link_like
+from .integrity import inspect_content, verify_content
 from .models import (
     ApplyResult,
     ChangePlan,
@@ -24,11 +26,10 @@ from .models import (
     CommittedPlaylistState,
     CommittedTrackState,
 )
-from .paths import is_direct_child, recovery_dir
+from .paths import _is_direct_child_of_resolved_folder, is_direct_child, recovery_dir
 from .presence import (
     ensure_recovery_parent,
     is_managed_entry,
-    is_recovery_path,
     validate_recovery_ancestors,
 )
 from .windows_names import is_valid_windows_name
@@ -68,6 +69,10 @@ def validate_plan(plan: ChangePlan) -> None:
     if _PLAN_ID_RE.fullmatch(plan.plan_id) is None:
         raise StalePlanError("The change plan identifier is unsafe.")
     folder = _validated_plan_folder(plan.folder)
+    try:
+        initial_stat = folder.stat()
+    except OSError as exc:
+        raise StalePlanError("The selected folder is no longer available.") from exc
     source_names, target_names, track_ids = _validate_renames(plan, folder)
     _validate_imports(plan, folder, source_names, target_names, track_ids)
     _validate_presence(plan, folder, source_names, target_names, track_ids)
@@ -75,6 +80,16 @@ def validate_plan(plan: ChangePlan) -> None:
     _validate_inventory_and_snapshots(plan, folder)
     _validate_occupied_rename_targets(plan, source_names)
     _validate_playlist_state(plan, folder)
+    current_folder = _validated_plan_folder(plan.folder)
+    try:
+        current_stat = current_folder.stat()
+    except OSError as exc:
+        raise StalePlanError("The selected folder is no longer available.") from exc
+    if (
+        current_folder != folder
+        or (current_stat.st_dev, current_stat.st_ino) != (initial_stat.st_dev, initial_stat.st_ino)
+    ):
+        raise StalePlanError("The selected folder changed during validation. Rescan before applying.")
 
 
 def _validated_plan_folder(path: Path) -> Path:
@@ -87,6 +102,20 @@ def _validated_plan_folder(path: Path) -> Path:
     if not folder.is_dir():
         raise StalePlanError("The selected folder is no longer available.")
     return folder
+
+
+def _validation_child(path: Path, folder: Path, *, missing: bool = False) -> bool:
+    if path.is_absolute() and path.parent == folder and path.name not in {".", ".."}:
+        try:
+            value = path.lstat()
+        except FileNotFoundError:
+            return missing
+        except OSError:
+            return False
+        return stat.S_ISREG(value.st_mode) and not (getattr(value, "st_file_attributes", 0) & 0x400)
+    if not _is_direct_child_of_resolved_folder(path, folder) or is_link_like(path):
+        return False
+    return path.is_file() or (missing and not path.exists())
 
 
 def _validate_renames(
@@ -106,7 +135,10 @@ def _validate_renames(
             or target_key in target_names
         ):
             raise StalePlanError("The change plan contains duplicate rename operations.")
-        if not is_direct_child(rename.source, folder) or not is_direct_child(rename.target, folder):
+        if (
+            not _validation_child(rename.source, folder)
+            or not _validation_child(rename.target, folder, missing=True)
+        ):
             raise StalePlanError("A rename operation points outside the selected folder.")
         if rename.source.suffix.casefold() not in SUPPORTED_AUDIO_EXTENSIONS:
             raise StalePlanError("A rename source is not a supported audio file.")
@@ -147,7 +179,7 @@ def _validate_imports(
             or operation.source.suffix.casefold() not in SUPPORTED_AUDIO_EXTENSIONS
         ):
             raise StalePlanError(f"An imported file is no longer available: {operation.source.name}")
-        if not is_direct_child(operation.target, folder):
+        if not _validation_child(operation.target, folder, missing=True):
             raise StalePlanError("An import target points outside the selected folder.")
         if (
             operation.target.suffix.casefold() not in SUPPORTED_AUDIO_EXTENSIONS
@@ -181,8 +213,8 @@ def _validate_presence(
     presence_sources: set[str] = set()
     presence_targets: set[str] = set()
     for presence_operation in plan.presence:
-        source_direct = is_direct_child(presence_operation.source, folder)
-        target_direct = is_direct_child(presence_operation.target, folder)
+        source_direct = _validation_child(presence_operation.source, folder)
+        target_direct = _validation_child(presence_operation.target, folder, missing=True)
         if (
             not presence_operation.track_id
             or presence_operation.track_id in track_ids
@@ -212,6 +244,8 @@ def _validate_presence(
             raise StalePlanError("Recovery source data is unavailable.") from exc
         if stat.st_size != presence_operation.size or stat.st_mtime_ns != presence_operation.mtime_ns:
             raise StalePlanError("A track changed before its presence could be updated.")
+        if presence_operation.action == "restore" and not presence_operation.sha256:
+            raise StalePlanError("Original content evidence is unavailable for this retained track; recovery data was preserved.")
         if presence_operation.sha256 and _hash_file(presence_operation.source) != presence_operation.sha256:
             raise StalePlanError("Recovery source data does not match the session command.")
         try:
@@ -247,7 +281,7 @@ def _validate_playlist_operations(plan: ChangePlan, folder: Path) -> None:
         if path_key in playlist_paths:
             raise StalePlanError("The change plan contains duplicate playlist operations.")
         if (
-            not is_direct_child(playlist_op.path, folder)
+            not _validation_child(playlist_op.path, folder, missing=True)
             or playlist_op.path.suffix.casefold()
             not in SUPPORTED_PLAYLIST_EXTENSIONS
         ):
@@ -270,7 +304,7 @@ def _validate_inventory_and_snapshots(plan: ChangePlan, folder: Path) -> None:
     if current_inventory != plan.folder_inventory:
         raise StalePlanError("The selected folder contents changed after preview. Rescan before applying.")
     for snapshot in plan.snapshots:
-        if not is_direct_child(snapshot.path, folder):
+        if not _validation_child(snapshot.path, folder):
             raise StalePlanError("A file snapshot points outside the selected folder.")
         if is_link_like(snapshot.path) or not snapshot.path.is_file():
             raise StalePlanError(f"A planned file is no longer a regular file: {snapshot.path.name}")
@@ -293,7 +327,7 @@ def _validate_occupied_rename_targets(
 
 def _validate_playlist_state(plan: ChangePlan, folder: Path) -> None:
     for playlist_op in plan.playlist_operations:
-        if not is_direct_child(playlist_op.path, folder):
+        if not _validation_child(playlist_op.path, folder, missing=playlist_op.expected_sha256 is None):
             raise StalePlanError("A playlist operation points outside the selected folder.")
         if playlist_op.path.exists() and is_link_like(playlist_op.path):
             raise StalePlanError(f"The playlist target is no longer a regular file: {playlist_op.path.name}")
@@ -321,20 +355,14 @@ def _journal_payload(
     presence_state: list[dict[str, str]],
     playlist_state: list[dict[str, str]],
     phase: str,
+    rename_state: list[dict[str, object]],
 ) -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "plan_id": plan.plan_id,
         "folder": str(plan.folder),
         "phase": phase,
-        "renames": [
-            {
-                "source": str(operation.source),
-                "temporary": str(temp_paths[operation.track_id]),
-                "target": str(operation.target),
-            }
-            for operation in plan.renames
-        ],
+        "renames": rename_state,
         "imports": import_state,
         "presence": presence_state,
         "playlists": playlist_state,
@@ -342,6 +370,9 @@ def _journal_payload(
 
 
 def _journal_items(payload: dict[str, object]) -> tuple[Path, list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], str]:
+    schema = payload.get("schema_version", 1)
+    if type(schema) is not int or schema not in {1, 2, 3}:
+        raise ValueError("Recovery journal schema is unsupported.")
     phase = str(payload.get("phase", "prepared"))
     if phase not in {"prepared", "imports-prepared", "temporary-renames", "presence-stashed", "final-renames", "presence-restored", "imports-final", "playlist-written", "complete"}:
         raise ValueError("Recovery journal contains an unknown transaction phase.")
@@ -357,22 +388,30 @@ def _journal_items(payload: dict[str, object]) -> tuple[Path, list[dict[str, obj
     playlists = [item for item in raw_playlists if isinstance(item, dict)]
     if len(renames) != len(raw_renames) or len(imports) != len(raw_imports) or len(presence) != len(raw_presence) or len(playlists) != len(raw_playlists):
         raise ValueError("Recovery journal operations are malformed.")
+    for item in (*renames, *presence):
+        size, digest = item.get("size"), item.get("sha256", "")
+        if (schema == 3 or size is not None or digest) and (
+            type(size) is not int or size < 0
+            or not isinstance(digest, str) or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None
+        ):
+            raise ValueError("Recovery journal original content evidence is malformed.")
 
     raw_folder = str(payload.get("folder", "")).strip()
     if raw_folder:
-        folder = Path(raw_folder).resolve(strict=False)
+        folder = _validated_plan_folder(Path(raw_folder))
     elif renames:
-        folder = Path(str(renames[0].get("source", ""))).resolve(strict=False).parent
+        folder = Path(str(renames[0].get("source", ""))).absolute().parent
     elif imports:
-        folder = Path(str(imports[0].get("target", ""))).resolve(strict=False).parent
+        folder = Path(str(imports[0].get("target", ""))).absolute().parent
     elif presence:
-        source = Path(str(presence[0].get("source", ""))).resolve(strict=False)
-        target = Path(str(presence[0].get("target", ""))).resolve(strict=False)
+        source = Path(str(presence[0].get("source", ""))).absolute()
+        target = Path(str(presence[0].get("target", ""))).absolute()
         folder = source.parent if presence[0].get("action") == "stash" else target.parent
     elif playlists:
-        folder = Path(str(playlists[0].get("target", ""))).resolve(strict=False).parent
+        folder = Path(str(playlists[0].get("target", ""))).absolute().parent
     else:
         raise ValueError("Recovery journal does not identify its folder.")
+    folder = _validated_plan_folder(folder)
 
     for item in renames:
         for key in ("source", "temporary", "target"):
@@ -409,8 +448,8 @@ def _journal_items(payload: dict[str, object]) -> tuple[Path, list[dict[str, obj
         action = str(item.get("action", ""))
         if (
             action not in {"stash", "restore"}
-            or not (is_direct_child(source, folder) or is_recovery_path(source, folder))
-            or not (is_direct_child(target, folder) or is_recovery_path(target, folder))
+            or not (is_direct_child(source, folder) or validate_recovery_ancestors(source, folder))
+            or not (is_direct_child(target, folder) or validate_recovery_ancestors(target, folder))
             or is_direct_child(source, folder) == is_direct_child(target, folder)
         ):
             raise ValueError("Recovery journal contains an unsafe presence path.")
@@ -423,19 +462,78 @@ def _journal_items(payload: dict[str, object]) -> tuple[Path, list[dict[str, obj
         ):
             raise ValueError("Recovery journal contains an out-of-folder playlist path.")
         for key in ("temporary", "backup"):
-            raw_path = str(item.get(key, "")).strip()
-            if raw_path:
-                internal_path = Path(raw_path)
-                if (
-                    not is_direct_child(internal_path, folder)
-                    or _PLAYLIST_TEMP_RE.fullmatch(internal_path.name) is None
-                ):
-                    raise ValueError("Recovery journal contains unsafe recovery data.")
+            raw_path = item.get(key)
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise ValueError(f"Recovery journal is missing a valid playlist {key} path.")
+            internal_path = Path(raw_path)
+            if (
+                not is_direct_child(internal_path, folder)
+                or _PLAYLIST_TEMP_RE.fullmatch(internal_path.name) is None
+            ):
+                raise ValueError("Recovery journal contains unsafe recovery data.")
         for key in ("before_sha256", "after_sha256"):
             value = str(item.get(key, ""))
             if value and (len(value) != 64 or any(char not in "0123456789abcdef" for char in value.casefold())):
                 raise ValueError("Recovery journal contains an invalid playlist hash.")
     return folder, renames, imports, presence, playlists, phase
+
+
+def _verify_original(path: Path, item: dict[str, object]) -> None:
+    verify_content(path, item.get("size"), item.get("sha256", ""))
+
+
+def _rename_candidate(item: dict[str, object], phase: str) -> tuple[Path, bool]:
+    source, temporary, target = (Path(str(item[key])) for key in ("source", "temporary", "target"))
+    state = item.get("rollback_state", "")
+    if state == "restored" or (state == "restoring" and not temporary.exists() and source.exists()):
+        return source, True
+    if temporary.exists():
+        return temporary, False
+    if state in {"staged", "restoring"}:
+        raise OSError(f"Could not locate staged recovery data for {source.name}.")
+    if phase not in {"prepared", "imports-prepared"} and target.exists():
+        return target, False
+    if source.exists():
+        return source, True
+    raise OSError(f"Could not locate original data for {source.name}.")
+
+
+def _preflight_recovery(renames, imports, presence, playlists, phase: str) -> None:
+    for item in renames:
+        candidate, _restored = _rename_candidate(item, phase)
+        _verify_original(candidate, item)
+    for item in presence:
+        source, target = Path(str(item["source"])), Path(str(item["target"]))
+        candidate = (target if item.get("action") == "stash" and item.get("rollback_done") is not True
+                     and target.exists() else source if source.exists() else target)
+        _verify_original(candidate, item)
+    for item in playlists:
+        target, backup = Path(str(item["target"])), Path(str(item["backup"]))
+        if backup.exists():
+            verify_content(backup, None, item.get("before_sha256", ""))
+            if target.exists():
+                verify_content(target, None, item.get("after_sha256", ""))
+        elif str(item.get("created", "false")).lower() != "true":
+            verify_content(target, None, item.get("before_sha256", ""))
+        elif target.exists():
+            verify_content(target, None, item.get("after_sha256", ""))
+        temporary = Path(str(item["temporary"]))
+        if temporary.exists():
+            verify_content(temporary, None, item.get("after_sha256", ""))
+    for item in imports:
+        if item.get("rollback_done") is True:
+            continue
+        temporary, target = Path(str(item["temporary"])), Path(str(item["target"]))
+        if temporary.exists():
+            verify_content(temporary, None, item.get("sha256", ""))
+        elif phase in {"presence-restored", "imports-final", "playlist-written"} and target.exists():
+            verify_content(target, None, item.get("sha256", ""))
+
+
+def _verified_unlink(path: Path, digest: str) -> None:
+    if path.exists() or is_link_like(path):
+        verify_content(path, None, digest)
+        path.unlink()
 
 
 def _cleanup_completed_journal(
@@ -448,7 +546,7 @@ def _cleanup_completed_journal(
         raw_temporary = str(item.get("temporary", ""))
         if raw_temporary:
             try:
-                Path(raw_temporary).unlink(missing_ok=True)
+                _verified_unlink(Path(raw_temporary), str(item.get("sha256", "")))
             except OSError as exc:
                 details.append(f"Could not remove completed import data: {exc}")
     for item in playlists:
@@ -458,7 +556,7 @@ def _cleanup_completed_journal(
                 continue
             cleanup_path = Path(raw_cleanup_path)
             try:
-                cleanup_path.unlink(missing_ok=True)
+                _verified_unlink(cleanup_path, str(item.get("before_sha256" if key == "backup" else "after_sha256", "")))
             except OSError as exc:
                 details.append(
                     "Could not remove completed transaction data "
@@ -485,8 +583,11 @@ def _cleanup_completed_journal(
 def _restore_playlists(
     playlists: list[dict[str, object]],
     details: list[str],
+    save: Callable[[], None],
 ) -> None:
     for item in reversed(playlists):
+        if item.get("rollback_done") is True:
+            continue
         target = Path(str(item.get("target", "")))
         backup = Path(str(item.get("backup", "")))
         created = str(item.get("created", "false")).lower() == "true"
@@ -494,137 +595,190 @@ def _restore_playlists(
         temporary = Path(raw_temporary) if raw_temporary else None
         try:
             if backup.exists():
+                verify_content(backup, None, str(item.get("before_sha256", "")))
                 if target.exists():
                     after_hash = str(item.get("after_sha256", ""))
-                    if not after_hash or _hash_file(target).casefold() != after_hash.casefold():
-                        details.append(
-                            f"Could not restore {target.name} because it changed after the interruption."
-                        )
-                        continue
+                    verify_content(target, None, after_hash)
                     target.unlink()
+                verify_content(backup, None, str(item.get("before_sha256", "")))
                 backup.rename(target)
             elif created and target.exists():
                 after_hash = str(item.get("after_sha256", ""))
-                if not after_hash or _hash_file(target).casefold() != after_hash.casefold():
-                    details.append(
-                        f"Could not remove {target.name} because it changed after the interruption."
-                    )
-                    continue
+                verify_content(target, None, after_hash)
                 target.unlink()
             if temporary is not None:
-                temporary.unlink(missing_ok=True)
+                _verified_unlink(temporary, str(item.get("after_sha256", "")))
+            item["rollback_done"] = True
         except OSError as exc:
             details.append(f"Could not restore playlist {target.name}: {exc}")
+    if playlists:
+        save()
 
 
 def _remove_imports(
     imports: list[dict[str, object]],
     phase: str,
     details: list[str],
+    save: Callable[[], None],
 ) -> None:
     for item in reversed(imports):
+        if item.get("rollback_done") is True:
+            continue
         target = Path(str(item.get("target", "")))
         temporary = Path(str(item.get("temporary", "")))
         digest = str(item.get("sha256", ""))
-        for candidate in (target, temporary):
+        installed = (
+            phase in {"presence-restored", "imports-final", "playlist-written"}
+            and not temporary.exists()
+        )
+        candidates = (target, temporary) if installed else (temporary,)
+        complete = True
+        for candidate in candidates:
             if not candidate.exists():
                 continue
             try:
-                uncommitted = candidate == temporary and phase in {
-                    "prepared",
-                    "imports-prepared",
-                    "temporary-renames",
-                    "final-renames",
-                }
-                if not uncommitted and (
-                    not digest
-                    or _hash_file(candidate).casefold() != digest.casefold()
-                ):
-                    details.append(
-                        f"Could not remove imported copy {candidate.name} because it changed."
-                    )
-                    continue
+                verify_content(candidate, None, digest)
                 candidate.unlink()
             except OSError as exc:
                 details.append(
                     f"Could not remove imported copy {candidate.name}: {exc}"
                 )
+                complete = False
+        if complete:
+            item["rollback_done"] = True
+    if imports:
+        save()
 
 
 def _return_restored_presence(
     folder: Path,
     presence: list[dict[str, object]],
     details: list[str],
+    save: Callable[[], None],
 ) -> None:
     for item in reversed(presence):
         if str(item.get("action", "")) != "restore":
             continue
+        if item.get("rollback_done") is True:
+            continue
         source = Path(str(item.get("source", "")))
         target = Path(str(item.get("target", "")))
         try:
+            _validate_presence_move(target, source, folder)
             if target.exists() and not source.exists():
                 ensure_recovery_parent(source, folder)
+                _validate_presence_move(target, source, folder)
+                _verify_original(target, item)
                 target.rename(source)
+            if not source.exists():
+                details.append(f"Recovery data is unavailable for {target.name}.")
+                continue
+            _verify_original(source, item)
+            item["rollback_done"] = True
         except OSError as exc:
             details.append(
                 f"Could not return restored track to recovery storage: {exc}"
             )
+    if presence:
+        save()
 
 
 def _restore_renames(
     renames: list[dict[str, object]],
     phase: str,
     details: list[str],
+    save: Callable[[], None],
 ) -> None:
-    staged: list[tuple[Path, Path]] = []
+    staged: list[tuple[dict[str, object], Path, Path]] = []
+    staging_failed = False
     for item in renames:
         source = Path(str(item.get("source", "")))
         temporary = Path(str(item.get("temporary", "")))
-        target = Path(str(item.get("target", "")))
-        current: Path | None = None
-        if temporary.exists():
-            current = temporary
-        elif phase not in {"prepared", "imports-prepared"} and target.exists():
-            current = target
-        elif source.exists():
-            continue
-        if current is None:
-            details.append(f"Could not locate the original data for {source.name}.")
-            continue
-        recovery_temp = source.parent / (
-            f".trackindex-recover-{uuid.uuid4().hex}.tmp{source.suffix}"
-        )
         try:
-            current.rename(recovery_temp)
-            staged.append((recovery_temp, source))
+            current, restored = _rename_candidate(item, phase)
+            _verify_original(current, item)
+            if restored:
+                item["rollback_state"] = "restored"
+                continue
+            if current != temporary:
+                current.rename(temporary)
+            item["rollback_state"] = "staged"
+            staged.append((item, temporary, source))
         except OSError as exc:
+            staging_failed = True
             details.append(f"Could not stage {source.name} for recovery: {exc}")
-    for recovery_temp, source in staged:
+    if staging_failed:
+        save()
+        return
+    for item, _temporary, _source in staged:
+        item["rollback_state"] = "restoring"
+    if renames:
+        save()
+    for item, recovery_temp, source in staged:
         try:
             if source.exists():
                 details.append(
                     f"Could not restore {source.name} because the original path is occupied."
                 )
                 continue
+            _verify_original(recovery_temp, item)
             recovery_temp.rename(source)
+            item["rollback_state"] = "restored"
         except OSError as exc:
             details.append(f"Could not restore {source.name}: {exc}")
+    if renames:
+        save()
+
+
+def _validate_presence_move(source: Path, target: Path, folder: Path) -> None:
+    try:
+        _validated_plan_folder(folder)
+    except StalePlanError as exc:
+        raise OSError(str(exc)) from exc
+    source_direct = is_direct_child(source, folder)
+    target_direct = is_direct_child(target, folder)
+    if source_direct == target_direct:
+        raise OSError("Presence recovery paths are unsafe.")
+    recovery = target if source_direct else source
+    direct = source if source_direct else target
+    if (
+        not validate_recovery_ancestors(recovery, folder)
+        or is_link_like(direct)
+        or (direct.exists() and not direct.is_file())
+    ):
+        raise OSError("Presence recovery storage became unsafe.")
 
 
 def _restore_stashed_presence(
+    folder: Path,
     presence: list[dict[str, object]],
     details: list[str],
+    save: Callable[[], None],
 ) -> None:
     for item in reversed(presence):
         if str(item.get("action", "")) != "stash":
             continue
+        if item.get("rollback_done") is True:
+            continue
         source = Path(str(item.get("source", "")))
         target = Path(str(item.get("target", "")))
         try:
+            _validate_presence_move(target, source, folder)
+            if target.exists() and source.exists():
+                details.append(f"Could not restore removed track {source.name} because its path is occupied.")
+                continue
             if target.exists() and not source.exists():
+                _verify_original(target, item)
                 target.rename(source)
+            if not source.exists():
+                details.append(f"Could not locate removed track {source.name}.")
+                continue
+            _verify_original(source, item)
+            item["rollback_done"] = True
         except OSError as exc:
             details.append(f"Could not restore removed track {source.name}: {exc}")
+    if presence:
+        save()
 
 
 def recover_journal(journal_path: Path) -> ApplyResult:
@@ -642,15 +796,26 @@ def recover_journal(journal_path: Path) -> ApplyResult:
     if phase == "complete":
         return _cleanup_completed_journal(journal_path, imports, playlists)
     details: list[str] = []
-    _restore_playlists(playlists, details)
-    _remove_imports(imports, phase, details)
-    _return_restored_presence(_folder, presence, details)
-    _restore_renames(renames, phase, details)
-    _restore_stashed_presence(presence, details)
+
+    def save() -> None:
+        atomic_write_json(journal_path, payload)
+
+    try:
+        _preflight_recovery(renames, imports, presence, playlists, phase)
+        _restore_playlists(playlists, details, save)
+        _remove_imports(imports, phase, details, save)
+        _return_restored_presence(_folder, presence, details, save)
+        _restore_renames(renames, phase, details, save)
+        _restore_stashed_presence(_folder, presence, details, save)
+    except (OSError, ValueError) as exc:
+        details.append(f"Could not record recovery progress: {exc}")
     if details:
         return ApplyResult(False, "Recovery was incomplete.", recovery_journal=journal_path, details=tuple(details))
-    with suppress(OSError):
+    try:
         journal_path.unlink(missing_ok=True)
+    except OSError as exc:
+        return ApplyResult(False, "Original files were restored, but the recovery journal could not be removed.",
+                           recovery_journal=journal_path, details=(str(exc),))
     return ApplyResult(True, "The interrupted operation was rolled back safely.")
 
 
@@ -755,6 +920,9 @@ class _TransactionExecution:
     presence_state: list[dict[str, str]]
     playlist_state: list[dict[str, str]]
     playlist_temps: dict[Path, Path]
+    rename_state: list[dict[str, object]]
+    root_identity: tuple[int, int]
+    canonical_root: Path
 
 
 def _available_internal_path(folder: Path, pattern: str, suffix: str) -> Path:
@@ -765,6 +933,8 @@ def _available_internal_path(folder: Path, pattern: str, suffix: str) -> Path:
 
 
 def _prepare_execution(plan: ChangePlan, journal: Path) -> _TransactionExecution:
+    canonical_root = _validated_plan_folder(plan.folder)
+    root_stat = canonical_root.stat()
     temp_paths = {
         operation.track_id: _available_internal_path(
             plan.folder,
@@ -786,7 +956,7 @@ def _prepare_execution(plan: ChangePlan, journal: Path) -> _TransactionExecution
             "source": str(operation.source),
             "temporary": str(import_temps[operation.track_id]),
             "target": str(operation.target),
-            "sha256": "",
+            "sha256": inspect_content(operation.source).sha256,
         }
         for operation in plan.imports
     ]
@@ -798,6 +968,16 @@ def _prepare_execution(plan: ChangePlan, journal: Path) -> _TransactionExecution
         }
         for operation in plan.presence
     ]
+    for operation, state in zip(plan.presence, presence_state, strict=True):
+        evidence = inspect_content(operation.source)
+        if evidence.size != operation.size or (operation.sha256 and evidence.sha256 != operation.sha256):
+            raise StalePlanError("Recovery content changed before journal preparation.")
+        state.update(size=evidence.size, sha256=evidence.sha256)
+    rename_state = []
+    for operation in plan.renames:
+        evidence = inspect_content(operation.source)
+        rename_state.append(dict(source=str(operation.source), temporary=str(temp_paths[operation.track_id]),
+                                 target=str(operation.target), size=evidence.size, sha256=evidence.sha256))
     playlist_state: list[dict[str, str]] = []
     playlist_temps: dict[Path, Path] = {}
     for operation in plan.playlist_operations:
@@ -840,7 +1020,17 @@ def _prepare_execution(plan: ChangePlan, journal: Path) -> _TransactionExecution
         presence_state,
         playlist_state,
         playlist_temps,
+        rename_state,
+        (root_stat.st_dev, root_stat.st_ino),
+        canonical_root,
     )
+
+
+def _check_execution_root(plan: ChangePlan, execution: _TransactionExecution) -> None:
+    folder = _validated_plan_folder(plan.folder)
+    value = folder.stat()
+    if folder != execution.canonical_root or (value.st_dev, value.st_ino) != execution.root_identity:
+        raise StalePlanError("The selected folder changed during the transaction.")
 
 
 def _checkpoint(
@@ -858,6 +1048,7 @@ def _checkpoint(
             execution.presence_state,
             execution.playlist_state,
             phase,
+            execution.rename_state,
         ),
     )
     if failure_injector is not None:
@@ -870,6 +1061,7 @@ def _prepare_transaction_inputs(
     failure_injector: Callable[[str], None] | None,
 ) -> None:
     _checkpoint(plan, execution, "prepared", failure_injector)
+    _check_execution_root(plan, execution)
     for import_operation, state in zip(
         plan.imports,
         execution.import_state,
@@ -896,23 +1088,33 @@ def _commit_track_paths(
     execution: _TransactionExecution,
     failure_injector: Callable[[str], None] | None,
 ) -> None:
-    for rename_operation in plan.renames:
+    _check_execution_root(plan, execution)
+    for rename_operation, state in zip(plan.renames, execution.rename_state, strict=True):
+        _verify_original(rename_operation.source, state)
         rename_operation.source.rename(
             execution.temp_paths[rename_operation.track_id]
         )
     _checkpoint(plan, execution, "temporary-renames", failure_injector)
-    for presence_operation in plan.presence:
+    _check_execution_root(plan, execution)
+    for presence_operation, state in zip(plan.presence, execution.presence_state, strict=True):
         if presence_operation.action == "stash":
             ensure_recovery_parent(presence_operation.target, plan.folder)
+            _validate_presence_move(presence_operation.source, presence_operation.target, plan.folder)
+            _verify_original(presence_operation.source, state)
             presence_operation.source.rename(presence_operation.target)
     _checkpoint(plan, execution, "presence-stashed", failure_injector)
-    for rename_operation in plan.renames:
+    _check_execution_root(plan, execution)
+    for rename_operation, state in zip(plan.renames, execution.rename_state, strict=True):
+        _verify_original(execution.temp_paths[rename_operation.track_id], state)
         execution.temp_paths[rename_operation.track_id].rename(
             rename_operation.target
         )
     _checkpoint(plan, execution, "final-renames", failure_injector)
-    for presence_operation in plan.presence:
+    _check_execution_root(plan, execution)
+    for presence_operation, state in zip(plan.presence, execution.presence_state, strict=True):
         if presence_operation.action == "restore":
+            _validate_presence_move(presence_operation.source, presence_operation.target, plan.folder)
+            _verify_original(presence_operation.source, state)
             if presence_operation.target.exists():
                 raise StalePlanError(
                     "A restored track target became occupied: "
@@ -920,6 +1122,7 @@ def _commit_track_paths(
                 )
             presence_operation.source.rename(presence_operation.target)
     _checkpoint(plan, execution, "presence-restored", failure_injector)
+    _check_execution_root(plan, execution)
     for import_operation in plan.imports:
         if import_operation.target.exists():
             raise StalePlanError(
@@ -936,6 +1139,7 @@ def _commit_playlists(
     execution: _TransactionExecution,
     failure_injector: Callable[[str], None] | None,
 ) -> None:
+    _check_execution_root(plan, execution)
     for operation, state in zip(
         plan.playlist_operations,
         execution.playlist_state,
@@ -965,6 +1169,7 @@ def _complete_transaction(
     plan: ChangePlan,
     execution: _TransactionExecution,
 ) -> ApplyResult:
+    _check_execution_root(plan, execution)
     internal_paths = {
         *execution.temp_paths.values(),
         *execution.import_temps.values(),
@@ -982,18 +1187,20 @@ def _complete_transaction(
             execution.presence_state,
             execution.playlist_state,
             "complete",
+            execution.rename_state,
         ),
     )
     cleanup_details: list[str] = []
     for state in execution.playlist_state:
         try:
-            Path(state["backup"]).unlink(missing_ok=True)
+            _verified_unlink(Path(state["backup"]), state["before_sha256"])
         except OSError as exc:
             cleanup_details.append(f"Could not remove playlist backup: {exc}")
-    try:
-        execution.journal.unlink(missing_ok=True)
-    except OSError as exc:
-        cleanup_details.append(f"Could not remove recovery journal: {exc}")
+    if not cleanup_details:
+        try:
+            execution.journal.unlink(missing_ok=True)
+        except OSError as exc:
+            cleanup_details.append(f"Could not remove recovery journal: {exc}")
     return ApplyResult(
         True,
         "Changes were applied successfully."
@@ -1025,7 +1232,22 @@ def apply_change_plan(
     except OSError as exc:
         return ApplyResult(False, f"Could not prepare recovery storage: {exc}")
     journal = journal_parent / f"{plan.plan_id}.json"
-    execution = _prepare_execution(plan, journal)
+    try:
+        execution = _prepare_execution(plan, journal)
+        prepared = _journal_payload(plan, execution.temp_paths, execution.import_state,
+                                    execution.presence_state, execution.playlist_state,
+                                    "prepared", execution.rename_state)
+        largest = json.loads(json.dumps(prepared))
+        for item in largest["renames"]:
+            item["rollback_state"] = "restoring"
+        for key in ("presence", "imports", "playlists"):
+            for item in largest[key]:
+                item["rollback_done"] = False
+        largest["phase"] = "temporary-renames"
+        if len((json.dumps(largest, indent=2) + "\n").encode("utf-8")) > _MAX_JOURNAL_BYTES:
+            raise ValueError("The recovery journal would exceed its supported size.")
+    except (OSError, RuntimeError, ValueError) as exc:
+        return ApplyResult(False, f"Could not prepare verified recovery evidence: {exc}")
     try:
         _prepare_transaction_inputs(plan, execution, failure_injector)
         _commit_track_paths(plan, execution, failure_injector)
@@ -1045,9 +1267,7 @@ def apply_change_plan(
             details=tuple(details),
         )
     finally:
-        for temporary in execution.import_temps.values():
-            with suppress(OSError):
-                temporary.unlink(missing_ok=True)
-        for temporary in execution.playlist_temps.values():
-            with suppress(OSError):
-                temporary.unlink(missing_ok=True)
+        if not journal.exists():
+            for temporary in (*execution.import_temps.values(), *execution.playlist_temps.values()):
+                with suppress(OSError):
+                    temporary.unlink(missing_ok=True)

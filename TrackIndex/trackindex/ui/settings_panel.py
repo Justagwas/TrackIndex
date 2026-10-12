@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
 )
 
 from .interaction import sync_pointer_cursor
+from .footer import add_version_to_header
+from trackindex.core.config import APP_VERSION
 from .theme import ThemePalette
 from .widgets.custom_controls import RoundHandleSliderStyle, SquareCheckBoxStyle
 
@@ -107,6 +109,8 @@ class SettingsPanel(QWidget):
         library_layout.addWidget(self.scan_button)
 
         updates_card, updates_layout = self._create_settings_card("Updates")
+        self.updates_card = updates_card
+        self.version_label = add_version_to_header(updates_card, updates_layout, APP_VERSION)
         self.auto_updates = QCheckBox("Automatic updates", updates_card)
         self.auto_updates.setChecked(auto_updates)
         self.auto_updates.toggled.connect(self.autoUpdatesChanged.emit)
@@ -119,12 +123,6 @@ class SettingsPanel(QWidget):
         self.reset_button.setObjectName("settingsActionButton")
         self.reset_button.clicked.connect(self.resetSettingsRequested.emit)
         updates_layout.addWidget(self.reset_button)
-        self.update_status = QLabel("Update status: ready", updates_card)
-        self.update_status.setObjectName("muted")
-        self.update_status.setWordWrap(True)
-        self.update_status.setMinimumWidth(0)
-        self.update_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        updates_layout.addWidget(self.update_status)
 
         layout.addStretch(1)
         self._slider_style = RoundHandleSliderStyle(
@@ -245,9 +243,6 @@ class SettingsPanel(QWidget):
         value = self._pending_ui_scale_percent
         self._pending_ui_scale_percent = None
         self.uiScaleChanged.emit(value)
-
-    def set_update_status(self, text: str) -> None:
-        self.update_status.setText(text)
 
     def set_values(
         self,

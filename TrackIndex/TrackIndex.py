@@ -24,11 +24,6 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from trackindex.core.config import (
-    APP_NAME,
-    APP_VERSION,
-    MUTEX_NAME,
-)
 
 
 def _enable_high_dpi_rendering() -> None:
@@ -78,6 +73,7 @@ class SingleInstanceGuard:
 
 
 def main() -> int:
+    from trackindex.core.config import APP_NAME, APP_VERSION, MUTEX_NAME
     _enable_high_dpi_rendering()
 
     from trackindex.core.metadata_service import prepare_all_metadata_backends
@@ -125,12 +121,16 @@ def main() -> int:
         music_root=config.music_root,
         icon_path=icon_path,
     )
-    controller = AppController(app, window, config)
-    with suppress(RuntimeError, TypeError):
-        app.aboutToQuit.disconnect(controller.shutdown)
-    playback = PlaybackController(app, window, controller, config)
-    app.aboutToQuit.connect(playback.shutdown)
-    app.aboutToQuit.connect(controller.shutdown)
+    try:
+        controller = AppController(app, window, config)
+        with suppress(RuntimeError, TypeError):
+            app.aboutToQuit.disconnect(controller.shutdown)
+        playback = PlaybackController(app, window, controller, config)
+        from trackindex.controller.shutdown_coordinator import ShutdownCoordinator
+        coordinator = ShutdownCoordinator(app, window, controller, playback)
+    except BaseException:
+        from trackindex.core.process_exit import emergency_exit
+        emergency_exit()
     window.show()
     try:
         return app.exec()

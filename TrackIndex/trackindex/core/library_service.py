@@ -13,6 +13,7 @@ from .config import (
 )
 from .filesystem import is_link_like, regular_file_stat, safe_directory_entry
 from .models import LibraryRecord
+from .presence import is_managed_entry
 from .scanner import natural_key
 from .windows_names import windows_name_error
 
@@ -74,7 +75,11 @@ def discover_library_folders(
         root = root.resolve()
     except (OSError, RuntimeError):
         return ()
-    if not root.is_dir() or is_link_like(root):
+    if (
+        not root.is_dir()
+        or is_link_like(root)
+        or any(is_managed_entry(path) for path in (root, *root.parents))
+    ):
         return ()
     found: list[Path] = []
     stack = [root]
@@ -94,7 +99,7 @@ def discover_library_folders(
             if regular_file_stat(entry) is not None:
                 if Path(entry.name).suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS:
                     has_audio = True
-            elif safe_directory_entry(entry):
+            elif safe_directory_entry(entry) and not is_managed_entry(Path(entry.name)):
                 children.append(Path(entry.path))
         if has_audio:
             try:
@@ -126,8 +131,6 @@ def create_library(root: Path, name: str) -> LibraryRecord:
         atomic_create_bytes(playlist, b"#EXTM3U\r\n")
     except Exception:
         try:
-            if created_folder:
-                playlist.unlink(missing_ok=True)
             if created_folder and folder.exists() and not any(folder.iterdir()):
                 folder.rmdir()
         except OSError:

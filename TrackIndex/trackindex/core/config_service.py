@@ -113,7 +113,7 @@ def _coerce_bool(value: object, default: bool) -> bool:
 def _coerce_int(value: object, default: int) -> int:
     try:
         return int(value) if isinstance(value, (str, bytes, bytearray, int, float)) else default
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -151,10 +151,7 @@ def load_config(path: Path | None = None) -> AppConfig:
 
     mode = StorageMode.BOTH.value
     theme = "light" if str(payload.get("theme_mode", "dark")).lower() == "light" else "dark"
-    try:
-        scale = int(payload.get("ui_scale_percent", 100))
-    except (TypeError, ValueError):
-        scale = 100
+    scale = _coerce_int(payload.get("ui_scale_percent", 100), 100)
     libraries = _parse_libraries(payload.get("libraries"))
     known_library_ids = {item.library_id for item in libraries}
     last_library_id = str(payload.get("last_library_id", ""))

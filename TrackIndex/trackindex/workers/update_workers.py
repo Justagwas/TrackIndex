@@ -2,13 +2,22 @@ from __future__ import annotations
 
 from threading import Event
 
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
 from trackindex.core import self_updater
-from trackindex.core.diagnostics import diagnostics_logger
+from trackindex.core.diagnostics import cleanup_legacy_logs, diagnostics_logger
 from trackindex.core.threading_contract import assert_qt_thread_affinity
 
 _LOG = diagnostics_logger("workers.update")
+
+
+class RuntimeCleanupTask(QRunnable):
+    def run(self) -> None:
+        for cleanup in (cleanup_legacy_logs, self_updater.cleanup_old_update_staging):
+            try:
+                cleanup()
+            except Exception:
+                _LOG.exception("Runtime cleanup failed")
 
 
 class UpdateCheckWorker(QObject):

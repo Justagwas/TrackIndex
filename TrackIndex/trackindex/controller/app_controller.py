@@ -71,6 +71,10 @@ from trackindex.ui.dialogs import (
 from trackindex.ui.main_window import MainWindow
 from trackindex.ui.theme import get_theme
 from trackindex.workers.library_workers import (
+    AcceptanceTask,
+    AcceptanceResult,
+    RecoveryTask,
+    RecoveryResult,
     AuditTask,
     AuditWorkerResult,
     DiscoveryWorker,
@@ -81,7 +85,7 @@ from trackindex.workers.library_workers import (
     TransactionTask,
     TransactionWorkerResult,
 )
-from trackindex.workers.update_workers import UpdateCheckWorker, UpdateInstallWorker
+from trackindex.workers.update_workers import RuntimeCleanupTask, UpdateCheckWorker, UpdateInstallWorker
 
 _LOG = diagnostics_logger("controller")
 
@@ -108,7 +112,7 @@ class AppController(QObject):
     _UPDATE_SHUTDOWN_WAIT_MS = 30000
 
     def __init__(self, app: QApplication, window: MainWindow, config: AppConfig) -> None:
-        super().__init__(window)
+        super().__init__(app)
         self.app, self.window, self.config = app, window, config
         register_private_path(config.music_root)
         for library in config.libraries:
@@ -122,16 +126,20 @@ class AppController(QObject):
         self._filesystem_gate = ReadWriteLock()
         self._metadata_paused = False
         self.generation = 0
-        self.metadata_pool = QThreadPool(window)
+        self.metadata_pool = QThreadPool(self)
         self.metadata_pool.setMaxThreadCount(2)
-        self.audit_pool = QThreadPool(window)
+        self.audit_pool = QThreadPool(self)
         self.audit_pool.setMaxThreadCount(1)
-        self.transaction_pool = QThreadPool(window)
+        self.transaction_pool = QThreadPool(self)
         self.transaction_pool.setMaxThreadCount(1)
-        self.prefetch_pool = QThreadPool(window)
+        self.prefetch_pool = QThreadPool(self)
         self.prefetch_pool.setMaxThreadCount(1)
         self.sessions = SessionManager()
         self._transaction_task: TransactionTask | None = None
+        self._acceptance_task: AcceptanceTask | None = None
+        self._acceptance_records: tuple[SessionRecoveryRecord, ...] = ()
+        self._recovery_task: RecoveryTask | None = None
+        self._startup_needs_reload = False
         self._transaction_preparing = False
         self._playback_coordinator: _PlaybackCoordinator | None = None
         self._plan_task: PlanTask | None = None
@@ -173,8 +181,20 @@ class AppController(QObject):
         self._setup_playlist_name = ""
         self._setup_source_playlist: Path | None = None
         self._setup_plan: ChangePlan | None = None
+        self._setup_plan_key: tuple | None = None
+        self._setup_request_id = 0
+        self._setup_preview_task: PlanTask | None = None
+        self._setup_preview_context: tuple | None = None
+        self._setup_preview_pending: tuple | None = None
+        self._setup_preview_timer = QTimer(self)
+        self._setup_preview_timer.setSingleShot(True)
+        self._setup_preview_timer.setInterval(75)
+        self._setup_preview_timer.timeout.connect(self._start_setup_preview)
         self._reconfigure_after_load = False
         self._shutdown_started = False
+        self._shutdown_finalizing = False
+        self._shutdown_saved = False
+        self._shutdown_settled = True
         self._connect()
         self._refresh_libraries()
         self.app.aboutToQuit.connect(self.shutdown)
@@ -216,8 +236,28 @@ class AppController(QObject):
         w.prefixRemovalRequested.connect(self.remove_filename_prefixes)
 
     def _startup(self) -> None:
-        self._recover_pending_operations()
+        if self._shutdown_started:
+            return
+        self.prefetch_pool.start(RuntimeCleanupTask())
+        if self._recover_pending_operations():
+            return
+        self._startup_after_journals()
+
+    def _startup_after_journals(self) -> None:
+        if self._shutdown_started:
+            return
         self._recover_sessions()
+        if self._acceptance_task is not None or self._shutdown_started:
+            return
+        self._startup_continue()
+
+    def _startup_continue(self) -> None:
+        if self._shutdown_started:
+            return
+        if self._startup_needs_reload:
+            self._startup_needs_reload = False
+            if self.current_library is not None:
+                self._load_current()
         if not self.config.initial_discovery_completed:
             self.scan_for_libraries(manual=False)
         else:
@@ -278,7 +318,8 @@ class AppController(QObject):
         QTimer.singleShot(0, restore_scroll)
 
     def _operation_busy(self) -> bool:
-        return self._plan_task is not None or self._transaction_task is not None or self._transaction_preparing
+        return (self._shutdown_started or self._recovery_task is not None or self._acceptance_task is not None
+                or self._plan_task is not None or self._transaction_task is not None or self._transaction_preparing)
 
     def set_playback_coordinator(self, coordinator: _PlaybackCoordinator) -> None:
         self._playback_coordinator = coordinator
@@ -343,7 +384,10 @@ class AppController(QObject):
         event: AuditWorkerResult,
     ) -> None:
         assert_qt_thread_affinity(self)
-        entry = self._prefetch_tasks.pop(event.generation, None)
+        entry = self._prefetch_tasks.get(event.generation)
+        if entry is None or event.task_id != entry[1].task_id:
+            return
+        self._prefetch_tasks.pop(event.generation)
         if (
             entry is None
             or event.error
@@ -399,7 +443,7 @@ class AppController(QObject):
         self.config.libraries = [records[library_id] for library_id in ids]
         save_config(self.config)
 
-    def _add_library(self, folder: Path, *, select: bool = True) -> LibraryRecord:
+    def _add_library(self, folder: Path, *, select: bool = True, persist: bool = True) -> LibraryRecord:
         normalized = normalize_folder(folder)
         register_private_path(normalized)
         existing = next((item for item in self.config.libraries if str(normalize_folder(item.folder)).casefold() == str(normalized).casefold()), None)
@@ -419,8 +463,9 @@ class AppController(QObject):
             self.config.libraries.append(record)
         if select:
             self.config.last_library_id = record.library_id
-        save_config(self.config)
-        self._refresh_libraries(record.library_id if select else None)
+        if persist:
+            save_config(self.config)
+            self._refresh_libraries(record.library_id if select else None)
         if select:
             self.select_library(record.library_id)
         return record
@@ -498,7 +543,7 @@ class AppController(QObject):
         *,
         resolve_canonical: bool = False,
     ) -> None:
-        if not self.current_library:
+        if self._shutdown_started or not self.current_library:
             return
         playlist_name = (
             self.current_library.canonical_playlist or self._setup_playlist_name or
@@ -537,6 +582,7 @@ class AppController(QObject):
         self.audit_pool.start(task)
 
     def _invalidate_library_work(self) -> int:
+        self._invalidate_setup_preview()
         self.generation += 1
         generation = self.generation
         self.audit = None
@@ -571,6 +617,8 @@ class AppController(QObject):
         result = event.audit
         task = self._audit_task
         token = self._audit_token
+        if task is None or event.task_id != task.task_id:
+            return
         if not self._libraries.owns_result(
             token,
             task.generation if task is not None else None,
@@ -708,6 +756,7 @@ class AppController(QObject):
         if (
             task is None
             or token is None
+            or event.task_id != task.task_id
             or generation != task.generation
             or generation != token.generation
         ):
@@ -740,6 +789,8 @@ class AppController(QObject):
     ) -> None:
         if not self.audit:
             return
+        for task in self._metadata_tasks.values():
+            task.stop()
         self.metadata_pool.clear()
         self._metadata_tasks.clear()
         self._metadata_queue.clear()
@@ -836,7 +887,7 @@ class AppController(QObject):
         self._pump_metadata_tasks()
 
     def _pump_metadata_tasks(self) -> None:
-        if self._metadata_paused:
+        if self._shutdown_started or self._metadata_paused:
             return
         while self._metadata_queue and len(self._metadata_tasks) < 2:
             track_id = self._metadata_queue.popleft()
@@ -866,9 +917,11 @@ class AppController(QObject):
         generation = event.generation
         track_id = event.track_id
         value = event.metadata
-        task = self._metadata_tasks.pop((generation, track_id), None)
-        if task is None:
+        key = (generation, track_id)
+        task = self._metadata_tasks.get(key)
+        if task is None or task.task_id != event.task_id:
             return
+        self._metadata_tasks.pop(key)
         self.metadata_cache.put(task.path, value, task.size, task.mtime_ns)
         if generation == self.generation and not self._metadata_paused:
             self._pending_metadata[track_id] = value
@@ -892,6 +945,9 @@ class AppController(QObject):
         self._load_current()
 
     def _refresh_setup_view(self) -> None:
+        self._invalidate_setup_preview()
+        if self._shutdown_started:
+            return
         if not self._setup_active or self.audit is None or self.current_library is None:
             return
         if not self.audit.tracks and not self._setup_reconfiguring:
@@ -901,25 +957,12 @@ class AppController(QObject):
         if self._setup_mode is StorageMode.FILENAMES and self._setup_source_playlist is not None:
             target = self._setup_source_playlist
         authority = self.selected_authority
-        plan = None
-        if not (self.audit.requires_authority_choice and authority is None):
-            try:
-                plan = build_change_plan(
-                    self.audit,
-                    self.audit.display_order,
-                    self._setup_mode,
-                    authority or self.audit.authority,
-                    target,
-                    playlist_source=(
-                        self._setup_source_playlist
-                        if self._setup_mode is not StorageMode.FILENAMES
-                        else None
-                    ),
-                )
-            except Exception:
-                _LOG.exception("Setup planning failed")
-                plan = None
-        self._setup_plan = plan
+        pending = not (self.audit.requires_authority_choice and authority is None)
+        if pending:
+            self._setup_preview_pending = (self._setup_request_id, self._setup_context_key(), self.audit,
+                                           self._setup_mode, authority or self.audit.authority, target,
+                                           self._setup_source_playlist if self._setup_mode is not StorageMode.FILENAMES else None)
+            self._setup_preview_timer.start()
         self.window.show_library_setup(
             self.audit,
             self.current_library,
@@ -927,8 +970,55 @@ class AppController(QObject):
             authority,
             self._setup_playlist_name,
             self._setup_reconfiguring,
-            plan,
+            None,
+            pending=pending,
         )
+
+    def _setup_context_key(self) -> tuple:
+        return (self.generation, self._snapshot_record_key(self.current_library) if self.current_library else None,
+                id(self.audit), self._audit_token, self.selected_authority, self._setup_mode,
+                self._setup_playlist_name, self._setup_source_playlist, self._setup_active)
+
+    def _invalidate_setup_preview(self) -> None:
+        self._setup_request_id += 1
+        self._setup_plan = None
+        self._setup_plan_key = None
+        self._setup_preview_pending = None
+        self._setup_preview_timer.stop()
+        if self._setup_preview_task is not None:
+            self._setup_preview_task.stop()
+
+    def _start_setup_preview(self) -> None:
+        if self._shutdown_started or self._setup_preview_task is not None or self._setup_preview_pending is None:
+            return
+        request = self._setup_preview_pending
+        self._setup_preview_pending = None
+        request_id, key, audit, mode, authority, target, source = request
+        if key != self._setup_context_key() or request_id != self._setup_request_id:
+            return
+        task = PlanTask(lambda: build_change_plan(audit, audit.display_order, mode, authority, target,
+                                                  playlist_source=source), self._filesystem_gate.read)
+        self._setup_preview_task = task
+        self._setup_preview_context = (request_id, key)
+        task.signals.planReady.connect(self._setup_preview_ready)
+        self.transaction_pool.start(task)
+
+    @Slot(object)
+    def _setup_preview_ready(self, result: PlanWorkerResult) -> None:
+        assert_qt_thread_affinity(self)
+        task = self._setup_preview_task
+        if task is None or task.task_id != result.task_id:
+            return
+        context = self._setup_preview_context
+        self._setup_preview_task = None
+        self._setup_preview_context = None
+        if (not self._shutdown_started and self._setup_active and context is not None
+                and context == (self._setup_request_id, self._setup_context_key())):
+            self._setup_plan = result.plan
+            self._setup_plan_key = context if result.plan is not None else None
+            self.window.update_setup_plan(result.plan, error=result.error or ("Planning was canceled." if result.plan is None else ""))
+        if not self._setup_preview_timer.isActive():
+            self._start_setup_preview()
 
     def _setup_selection_changed(self, mode_value: str, authority_value: str) -> None:
         if not self._setup_active or self.current_library is None:
@@ -979,6 +1069,7 @@ class AppController(QObject):
             self._refresh_setup_view()
 
     def _cancel_setup(self) -> None:
+        self._invalidate_setup_preview()
         if self.current_library is None:
             return
         self._setup_active = not self.current_library.setup_completed
@@ -1084,10 +1175,16 @@ class AppController(QObject):
         ):
             return
         plan = self._setup_plan
+        ownership = (self._setup_request_id, self._setup_context_key())
+        if self._shutdown_started or ownership != self._setup_plan_key:
+            return
         if plan.blockers:
             self.window.update_setup_plan(plan)
             return
         if not self._confirm_plan_warnings(plan, "Review library warnings"):
+            return
+        if (self._shutdown_started or plan is not self._setup_plan
+                or ownership != (self._setup_request_id, self._setup_context_key()) or self._operation_busy()):
             return
         order = tuple(self.audit.display_order)
         command = self._command_for_plan(
@@ -1118,7 +1215,14 @@ class AppController(QObject):
         )
 
     def _rescan_library(self, library_id: str) -> None:
+        if self._shutdown_started:
+            return
         if self.current_library and self.current_library.library_id == library_id:
+            if self._operation_busy():
+                self.window.show_toast(
+                    "Wait for the current operation to finish before rescanning.", None
+                )
+                return
             self._load_current()
 
     def open_in_explorer(self, library_id: str) -> None:
@@ -1539,6 +1643,8 @@ class AppController(QObject):
         context: TransactionOperationContext,
         prepare: Callable[[], None] | None = None,
     ) -> None:
+        if self._shutdown_started or self._acceptance_task is not None:
+            return
         plan = context.plan
         self._reconcile_timer.stop()
         if self._reconcile_task is not None:
@@ -1596,6 +1702,8 @@ class AppController(QObject):
         context: TransactionOperationContext,
         prepare: Callable[[], None] | None = None,
     ) -> None:
+        if self._shutdown_started or self._acceptance_task is not None:
+            return
         transaction_task = TransactionTask(
             context.plan,
             self._filesystem_gate.write,
@@ -1623,6 +1731,14 @@ class AppController(QObject):
         kind = context.kind
         plan = context.plan
         if not result.success:
+            if result.recovery_journal is None:
+                try:
+                    self.sessions.abort(command)
+                except Exception:
+                    self.sessions.protect_recovery(context.library_id)
+                    _LOG.exception("Rolled-back command could not be cleared from session preparation")
+            else:
+                self.sessions.protect_recovery(context.library_id)
             if kind == "forward" and context.before is not None:
                 self.window.track_table.track_model.restore_order(context.before)
             self.window.set_saving(False, "Not saved")
@@ -1643,6 +1759,7 @@ class AppController(QObject):
             _names, toast = self._commit_successful_command(context, command)
         except Exception as exc:
             bookkeeping_error = exc
+            self.sessions.protect_recovery(context.library_id)
             _LOG.exception("Committed change could not be recorded in session history")
             toast = "Changes saved"
         projected = self._apply_committed_result(context, command, result)
@@ -1806,7 +1923,7 @@ class AppController(QObject):
         self.scan_for_libraries(manual=True)
 
     def scan_for_libraries(self, *, manual: bool) -> None:
-        if self._discovery_thread is not None:
+        if self._shutdown_started or self._discovery_thread is not None:
             return
         root = Path(self.config.music_root)
         if not root.is_dir():
@@ -1815,8 +1932,7 @@ class AppController(QObject):
             self.config.initial_discovery_completed = True
             save_config(self.config)
             return
-        self.window.settings_panel.set_update_status("Scanning music folders...")
-        thread = QThread(self.window)
+        thread = QThread(self)
         worker = DiscoveryWorker(root)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1825,7 +1941,6 @@ class AppController(QObject):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._clear_discovery_thread)
-        thread.finished.connect(thread.deleteLater)
         self._discovery_thread, self._discovery_worker = thread, worker
         thread.start()
 
@@ -1838,7 +1953,6 @@ class AppController(QObject):
         save_config(self.config)
         known = {str(normalize_folder(item.folder)).casefold() for item in self.config.libraries}
         new = tuple(item for item in folders if str(normalize_folder(item)).casefold() not in known)
-        self.window.settings_panel.set_update_status(f"Found {len(folders)} music libraries.")
         if not new:
             self._start_snapshot_prefetch()
             return
@@ -1847,7 +1961,8 @@ class AppController(QObject):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         for folder in dialog.selected_folders():
-            self._add_library(folder, select=False)
+            self._add_library(folder, select=False, persist=False)
+        save_config(self.config)
         self._refresh_libraries()
         self._start_snapshot_prefetch()
 
@@ -1858,7 +1973,6 @@ class AppController(QObject):
             return
         self.config.initial_discovery_completed = True
         save_config(self.config)
-        self.window.settings_panel.set_update_status("Library scan failed.")
         styled_message(
             self.window,
             QMessageBox.Icon.Warning,
@@ -1867,16 +1981,47 @@ class AppController(QObject):
         ).exec()
 
     @Slot()
-    def _clear_discovery_thread(self) -> None:
+    def _clear_discovery_thread(self, expected: QThread | None = None) -> None:
         assert_qt_thread_affinity(self)
+        thread = expected if expected is not None else self._discovery_thread
+        if thread is None or thread is not self._discovery_thread:
+            return
+        if not thread.wait(0):
+            QTimer.singleShot(1, lambda thread=thread: self._clear_discovery_thread(thread))
+            return
+        thread.deleteLater()
         self._discovery_thread = None
         self._discovery_worker = None
 
-    def _recover_pending_operations(self) -> None:
-        for journal in pending_journals():
-            result = recover_journal(journal)
-            if not result.success:
-                styled_message(self.window, QMessageBox.Icon.Critical, "Recovery incomplete", result.message).exec()
+    def _recover_pending_operations(self) -> bool:
+        if self._shutdown_started or self._recovery_task is not None:
+            return False
+        journals = pending_journals()
+        if not journals:
+            return False
+        self._invalidate_library_work()
+        self._startup_needs_reload = True
+        task = RecoveryTask(journals, self._filesystem_gate.write)
+        self._recovery_task = task
+        task.signals.recoveryDone.connect(self._journals_recovered)
+        self.transaction_pool.start(task)
+        return True
+
+    @Slot(object)
+    def _journals_recovered(self, result: RecoveryResult) -> None:
+        assert_qt_thread_affinity(self)
+        if self._recovery_task is None or self._recovery_task.task_id != result.task_id:
+            return
+        self._recovery_task = None
+        for outcome in result.results:
+            if not outcome.success:
+                self._shutdown_settled = False
+            if self._shutdown_started:
+                continue
+            if not outcome.success:
+                styled_message(self.window, QMessageBox.Icon.Critical, "Recovery incomplete", outcome.message).exec()
+        if not self._shutdown_started:
+            self._startup_after_journals()
 
     def _recover_sessions(self) -> None:
         records = self.sessions.pending_recovery()
@@ -1900,17 +2045,13 @@ class AppController(QObject):
         box.button(QMessageBox.StandardButton.Yes).setText("Keep Changes")
         box.button(QMessageBox.StandardButton.No).setText("Restore Session Start")
         box.setDefaultButton(QMessageBox.StandardButton.Yes)
-        if box.exec() == QMessageBox.StandardButton.Yes:
-            self._keep_recovery_records(records)
+        keep = box.exec() == QMessageBox.StandardButton.Yes
+        if self._shutdown_started:
             return
-        failures = self._restore_recovery_records(records)
-        if failures:
-            styled_message(
-                self.window,
-                QMessageBox.Icon.Critical,
-                "Session restore incomplete",
-                "\n".join(failures),
-            ).exec()
+        if keep:
+            self._start_acceptance(tuple(record.library_id for record in records), records)
+            return
+        self._start_acceptance(tuple(record.library_id for record in records), restore_records=records)
 
     def _partition_recovery_records(
         self,
@@ -1933,11 +2074,14 @@ class AppController(QObject):
     def _keep_recovery_records(
         self,
         records: tuple[SessionRecoveryRecord, ...],
-    ) -> None:
+    ) -> list[str]:
+        failures: list[str] = []
         for record in records:
             if record.commands:
                 self._apply_command_library_state(record.commands[-1], True)
-            self.sessions.keep_recovery(record.library_id)
+            if not self.sessions.keep_recovery(record.library_id):
+                failures.append(f"Could not finalize recovery for {record.folder.name}. Its recovery data was retained.")
+        return failures
 
     def _restore_recovery_records(
         self,
@@ -1948,9 +2092,63 @@ class AppController(QObject):
             error = self._restore_recovery_record(record)
             if error:
                 failures.append(error)
-            else:
-                self.sessions.keep_recovery(record.library_id)
+            elif not self.sessions.keep_recovery(record.library_id):
+                failures.append(f"Could not finalize recovery for {record.folder.name}. Its recovery data was retained.")
         return failures
+
+    def _start_acceptance(self, library_ids: tuple[str, ...], records: tuple[SessionRecoveryRecord, ...] = (),
+                          restore_records: tuple[SessionRecoveryRecord, ...] = ()) -> None:
+        if self._acceptance_task is not None:
+            return
+        if records or restore_records:
+            self._invalidate_library_work()
+            self._startup_needs_reload = True
+        self._acceptance_records = records
+        task = AcceptanceTask(self.sessions.root, library_ids, self._filesystem_gate.write, restore_records)
+        self._acceptance_task = task
+        task.signals.acceptanceDone.connect(self._acceptance_done)
+        self.transaction_pool.start(task)
+
+    @Slot(object)
+    def _acceptance_done(self, result: AcceptanceResult) -> None:
+        assert_qt_thread_affinity(self)
+        if self._acceptance_task is None or result.task_id != self._acceptance_task.task_id:
+            return
+        records = self._acceptance_records
+        self._acceptance_task = None
+        self._acceptance_records = ()
+        accepted = result.accepted
+        if not result.finalized:
+            persisted = True
+            try:
+                for command in result.restored_commands:
+                    self._apply_command_library_state(command, False)
+                for record in records:
+                    if record.library_id in accepted and record.commands:
+                        self._apply_command_library_state(record.commands[-1], True)
+                save_config(self.config)
+            except (OSError, RuntimeError, ValueError):
+                _LOG.exception("Acceptance state could not be persisted; session evidence was retained")
+                accepted = ()
+                persisted = False
+                self._shutdown_settled = False
+            if persisted and set(accepted) == set(result.requested):
+                task = AcceptanceTask(self.sessions.root, accepted, self._filesystem_gate.write, finalize=True)
+                self._acceptance_task = task
+                task.signals.acceptanceDone.connect(self._acceptance_done)
+                self.transaction_pool.start(task)
+                return
+        else:
+            for library_id in accepted:
+                self.sessions._finish_pending(library_id)
+                self.sessions.histories.pop(library_id, None)
+        for library_id in set(result.requested) - set(accepted):
+            self.sessions.protect_recovery(library_id)
+            self._shutdown_settled = False
+        if not self._shutdown_started:
+            if set(result.requested) != set(accepted):
+                self.window.show_toast("Recovery data was retained because it could not be verified or finalized.", None)
+            self._startup_continue()
 
     def _restore_recovery_record(self, record: SessionRecoveryRecord) -> str:
         for command in reversed(record.commands):
@@ -2033,11 +2231,10 @@ class AppController(QObject):
         self.window.apply_appearance(get_theme("dark"), "dark", defaults.ui_scale_percent)
 
     def check_for_updates(self, *, manual: bool) -> None:
-        if self._update_thread is not None:
+        if self._shutdown_started or self._update_thread is not None:
             return
         self._updates.begin_check(manual)
-        self.window.settings_panel.set_update_status("Checking for updates...")
-        thread = QThread(self.window)
+        thread = QThread(self)
         worker = UpdateCheckWorker()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -2046,7 +2243,6 @@ class AppController(QObject):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._clear_update_thread)
-        thread.finished.connect(thread.deleteLater)
         self._update_thread, self._update_worker = thread, worker
         thread.start()
 
@@ -2055,11 +2251,9 @@ class AppController(QObject):
         if self._shutdown_started:
             return
         if not check.update_available:
-            self.window.settings_panel.set_update_status("")
             if self._updates.manual:
                 styled_message(self.window, QMessageBox.Icon.Information, "No update available", "You are already on the latest version").exec()
             return
-        self.window.settings_panel.set_update_status(f"TrackIndex {check.latest_version} is available.")
         self._updates.record_check(check)
         notes = [f"- {line}" for line in check.notes[:8] if str(line).strip()]
         details = "\n\nWhat's new:\n" + "\n".join(notes) if notes else ""
@@ -2076,7 +2270,7 @@ class AppController(QObject):
             details_text=details,
             install_supported=can_install,
         )
-        if not proceed:
+        if self._shutdown_started or not proceed:
             return
         if can_install and auto_install:
             self._start_update_install(check)
@@ -2087,17 +2281,18 @@ class AppController(QObject):
         assert_qt_thread_affinity(self)
         if self._shutdown_started:
             return
-        self.window.settings_panel.set_update_status("Update check unavailable.")
         if self._updates.manual:
             styled_message(self.window, QMessageBox.Icon.Warning, "Update check failed", message).exec()
 
     def _start_update_install(self, check) -> None:
+        if self._shutdown_started:
+            return
         if self._update_thread is not None:
             QTimer.singleShot(100, lambda: self._start_update_install(check))
             return
         dialog = UpdateProgressDialog(self.window)
         dialog.setStyleSheet(self.window.styleSheet())
-        thread = QThread(self.window)
+        thread = QThread(self)
         worker = UpdateInstallWorker(check)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -2108,7 +2303,6 @@ class AppController(QObject):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._clear_update_thread)
-        thread.finished.connect(thread.deleteLater)
         dialog.rejected.connect(worker.stop)
         self._progress_dialog = dialog
         self._update_thread, self._update_worker = thread, worker
@@ -2133,9 +2327,11 @@ class AppController(QObject):
             default_restart=True,
             requires_elevation=prepared.requires_elevation,
         )
+        if self._shutdown_started:
+            self_updater.discard_prepared_update(prepared)
+            return
         if not proceed:
             self_updater.discard_prepared_update(prepared)
-            self.window.settings_panel.set_update_status("Update canceled before installation.")
             styled_message(
                 self.window,
                 QMessageBox.Icon.Information,
@@ -2143,17 +2339,14 @@ class AppController(QObject):
                 "Update was aborted. No installer was launched.",
             ).exec()
             return
-        try:
-            self_updater.launch_prepared_update(
-                prepared,
-                restart_after_update=restart_after,
-            )
-        except Exception as exc:
+        coordinator = getattr(self.app, "shutdown_coordinator", None)
+        if coordinator is None:
             self_updater.discard_prepared_update(prepared)
-            styled_message(self.window, QMessageBox.Icon.Critical, "Update failed", str(exc)).exec()
-            self._offer_update_page_fallback()
+            self.window.show_toast("TrackIndex could not close safely to start the update.", None)
             return
-        self.app.quit()
+        coordinator.request(lambda: self_updater.launch_prepared_update(prepared, restart_after_update=restart_after),
+                            lambda: self_updater.discard_prepared_update(prepared),
+                            handoff_failed=self._show_update_install_failure)
 
     @Slot(str)
     def _update_install_failed(self, message: str) -> None:
@@ -2161,6 +2354,9 @@ class AppController(QObject):
         if self._shutdown_started:
             return
         self._close_update_progress()
+        self._show_update_install_failure(message)
+
+    def _show_update_install_failure(self, message: str) -> None:
         styled_message(
             self.window,
             QMessageBox.Icon.Critical,
@@ -2175,7 +2371,6 @@ class AppController(QObject):
         if self._shutdown_started:
             return
         self._close_update_progress()
-        self.window.settings_panel.set_update_status("Update canceled.")
         styled_message(
             self.window,
             QMessageBox.Icon.Information,
@@ -2213,8 +2408,15 @@ class AppController(QObject):
         if answer.exec() == QMessageBox.StandardButton.Yes:
             self._open_update_page(self._updates.fallback_url())
 
-    def _clear_update_thread(self) -> None:
+    def _clear_update_thread(self, expected: QThread | None = None) -> None:
         assert_qt_thread_affinity(self)
+        thread = expected if expected is not None else self._update_thread
+        if thread is None or thread is not self._update_thread:
+            return
+        if not thread.wait(0):
+            QTimer.singleShot(1, lambda thread=thread: self._clear_update_thread(thread))
+            return
+        thread.deleteLater()
         self._update_thread = self._update_worker = None
         prepared = self._updates.take_prepared()
         if prepared is not None:
@@ -2224,28 +2426,22 @@ class AppController(QObject):
         if self._shutdown_started:
             return
         self._shutdown_started = True
+        self._invalidate_setup_preview()
         self._transaction_preparing = False
         self._reconcile_timer.stop()
-        self._finish_plan_for_shutdown()
         self._request_worker_shutdown()
-        self._finish_transaction_for_shutdown()
         self._stop_library_work()
-        self._wait_for_worker_shutdown()
-        self._persist_shutdown_state()
+        if self._plan_task is not None:
+            self._plan_task.stop()
 
     def _finish_plan_for_shutdown(self) -> None:
         active_plan = self._plan_task
         if active_plan is None:
             return
-        plan_finished = self.transaction_pool.waitForDone(
-            self._SHORT_SHUTDOWN_WAIT_MS
-        )
+        plan_finished = self.transaction_pool.waitForDone(0)
         if not plan_finished:
-            _LOG.error("Planning worker did not stop before the shutdown deadline")
             return
         if self._plan_task is active_plan:
-            with suppress(RuntimeError, TypeError):
-                active_plan.signals.planReady.disconnect()
             self._plan_task = None
             self._mutations.abandon_plan()
 
@@ -2261,19 +2457,13 @@ class AppController(QObject):
         for _token, task in self._prefetch_tasks.values():
             task.stop()
         self.prefetch_pool.clear()
-        self._prefetch_tasks.clear()
 
     def _finish_transaction_for_shutdown(self) -> None:
         active_transaction = self._transaction_task
         if active_transaction is None:
             return
-        transaction_finished = self.transaction_pool.waitForDone(
-            self._TRANSACTION_SHUTDOWN_WAIT_MS
-        )
+        transaction_finished = self.transaction_pool.waitForDone(0)
         if not transaction_finished:
-            _LOG.error(
-                "Filesystem transaction did not stop before the shutdown deadline; recovery state was retained"
-            )
             return
         if self._transaction_task is not active_transaction or active_transaction.result is None:
             return
@@ -2284,16 +2474,29 @@ class AppController(QObject):
             try:
                 self._commit_successful_command(context, context.command)
             except Exception:
+                self._shutdown_settled = False
+                self.sessions.protect_recovery(context.library_id)
                 _LOG.exception(
                     "Successful filesystem transaction could not be committed to session history"
                 )
-                return
         elif active_transaction.result.success:
-            return
+            self._shutdown_settled = False
+        elif context is not None:
+            if active_transaction.result.recovery_journal is not None:
+                self._shutdown_settled = False
+                self.sessions.protect_recovery(context.library_id)
+            else:
+                try:
+                    self.sessions.abort(context.command)
+                except Exception:
+                    self._shutdown_settled = False
+                    self.sessions.protect_recovery(context.library_id)
+                    _LOG.exception("Rolled-back command could not be cleared during shutdown")
         self._transaction_task = None
         self._mutations.abandon_transaction()
 
     def _stop_library_work(self) -> None:
+        self._metadata_flush_timer.stop()
         if self._audit_task is not None:
             self._audit_task.stop()
         if self._reconcile_task is not None:
@@ -2307,30 +2510,43 @@ class AppController(QObject):
         self._metadata_candidates.clear()
 
     def _wait_for_worker_shutdown(self) -> None:
-        if not self.audit_pool.waitForDone(self._SHORT_SHUTDOWN_WAIT_MS):
-            _LOG.error("Audit worker did not stop before the shutdown deadline")
-        if not self.metadata_pool.waitForDone(self._SHORT_SHUTDOWN_WAIT_MS):
-            _LOG.error("Metadata workers did not stop before the shutdown deadline")
-        if not self.prefetch_pool.waitForDone(self._SHORT_SHUTDOWN_WAIT_MS):
-            _LOG.error("Prefetch worker did not stop before the shutdown deadline")
-        if (
-            self._discovery_thread is not None
-            and not self._discovery_thread.wait(self._SHORT_SHUTDOWN_WAIT_MS)
-        ):
-            _LOG.error("Discovery worker did not stop before the shutdown deadline")
-        if (
-            self._update_thread is not None
-            and not self._update_thread.wait(self._UPDATE_SHUTDOWN_WAIT_MS)
-        ):
-            _LOG.error("Update worker did not stop before the shutdown deadline")
+        self.shutdown_drained()
+
+    def shutdown_drained(self) -> bool:
+        pools = (self.audit_pool, self.metadata_pool, self.prefetch_pool, self.transaction_pool)
+        if not all(pool.waitForDone(0) for pool in pools):
+            return False
+        if any(thread is not None and not thread.wait(0) for thread in (self._discovery_thread, self._update_thread)):
+            return False
+        self._finish_plan_for_shutdown()
+        self._finish_transaction_for_shutdown()
+        task = self._acceptance_task
+        if task is not None and task.result is not None:
+            self._acceptance_done(task.result)
+        recovery = self._recovery_task
+        if recovery is not None and recovery.result is not None:
+            self._journals_recovered(recovery.result)
+        return self._transaction_task is None and self._acceptance_task is None and self._recovery_task is None
+
+    def begin_shutdown_finalization(self) -> None:
+        if self._shutdown_finalizing:
+            return
+        self._shutdown_finalizing = True
+        if self.sessions._protected_libraries:
+            self._shutdown_settled = False
+        self._start_acceptance(self.sessions.acceptance_ids())
+
+    def shutdown_finalized(self) -> bool:
+        if not self.shutdown_drained():
+            return False
+        if not self._shutdown_saved:
+            self._persist_shutdown_state()
+            self._shutdown_saved = True
+        return True
 
     def _persist_shutdown_state(self) -> None:
-        if self._transaction_task is None:
-            try:
-                self.sessions.accept_all()
-            except (OSError, ValueError):
-                _LOG.exception("Session manifests could not be accepted during shutdown")
         try:
             save_config(self.config)
         except (OSError, ValueError):
+            self._shutdown_settled = False
             _LOG.exception("Configuration could not be saved during shutdown")

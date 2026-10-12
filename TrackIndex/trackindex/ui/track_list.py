@@ -111,11 +111,19 @@ class TrackTableModel(QAbstractTableModel):
 
     def set_tracks(self, tracks: list[TrackRecord]) -> None:
         self.beginResetModel()
+        self._invalidate_changed_metadata(tracks)
         self.tracks = list(tracks)
         self._rebuild_row_index()
         valid = {item.track_id for item in tracks}
         self.metadata = {key: value for key, value in self.metadata.items() if key in valid}
         self.endResetModel()
+
+    def _invalidate_changed_metadata(self, tracks: list[TrackRecord]) -> None:
+        previous = {track.track_id: track for track in self.tracks}
+        for track in tracks:
+            old = previous.get(track.track_id)
+            if old is None or (old.size, old.mtime_ns) != (track.size, track.mtime_ns):
+                self.metadata.pop(track.track_id, None)
 
     def reconcile_tracks(self, tracks: list[TrackRecord]) -> bool:
 
@@ -125,6 +133,7 @@ class TrackTableModel(QAbstractTableModel):
             self.set_tracks(tracks)
             return False
 
+        self._invalidate_changed_metadata(tracks)
         incoming_ids = set(incoming)
         removed_rows = [row for row, track in enumerate(self.tracks) if track.track_id not in incoming_ids]
         removed_ranges: list[tuple[int, int]] = []
@@ -538,7 +547,7 @@ class TrackDelegate(QStyledItemDelegate):
                     diameter,
                 )
                 painter.drawEllipse(circle)
-                painter.setBrush(QColor(self.theme.text_primary))
+                painter.setBrush(QColor("#FFFFFF"))
                 if view.playing_track_id == track.track_id and view.playback_playing:
                     bar_width = max(2, self._scaled(3, 2))
                     bar_height = self._scaled(10, 8)

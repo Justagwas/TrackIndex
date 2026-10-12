@@ -18,10 +18,15 @@ from trackindex.core.metadata_service import (
     prepare_metadata_backend,
     read_track_metadata,
 )
-from trackindex.core.models import ApplyResult, AuditResult, ChangePlan, TrackMetadata
+from trackindex.core.models import (
+    ApplyResult, AuditResult, ChangePlan, OrderAuthority,
+    SessionCommand, SessionRecoveryRecord, TrackMetadata,
+)
+from trackindex.core.planner import build_session_change_plan
 from trackindex.core.scanner import audit_folder, parse_filename_index
 from trackindex.core.threading_contract import assert_qt_thread_affinity
-from trackindex.core.transaction import apply_change_plan
+from trackindex.core.transaction import apply_change_plan, recover_journal
+from trackindex.core.session_service import SessionManager
 
 _LOG = diagnostics_logger("workers.library")
 
@@ -31,6 +36,99 @@ class WorkerSignals(QObject):
     auditReady = Signal(object)
     transactionDone = Signal(object)
     planReady = Signal(object)
+    acceptanceDone = Signal(object)
+    recoveryDone = Signal(object)
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryResult:
+    task_id: str
+    results: tuple[ApplyResult, ...]
+
+
+class RecoveryTask(QRunnable):
+    def __init__(self, journals: tuple[Path, ...], filesystem_access) -> None:
+        super().__init__()
+        self.journals = journals
+        self.filesystem_access = filesystem_access
+        self.task_id = uuid.uuid4().hex
+        self.signals = WorkerSignals()
+        self.result: RecoveryResult | None = None
+
+    @Slot()
+    def run(self) -> None:
+        results: list[ApplyResult] = []
+        try:
+            with self.filesystem_access():
+                for path in self.journals:
+                    try:
+                        result = recover_journal(path)
+                    except Exception as exc:
+                        _LOG.exception("Interrupted operation recovery failed for one journal")
+                        result = ApplyResult(False, str(exc), recovery_journal=path)
+                    results.append(result)
+        except Exception as exc:
+            _LOG.exception("Interrupted operation recovery could not acquire or release filesystem access")
+            results.extend(
+                ApplyResult(False, str(exc), recovery_journal=path)
+                for path in self.journals[len(results):]
+            )
+        self.result = RecoveryResult(self.task_id, tuple(results))
+        self.signals.recoveryDone.emit(self.result)
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceResult:
+    task_id: str
+    accepted: tuple[str, ...]
+    requested: tuple[str, ...]
+    error: str = ""
+    restored_commands: tuple[SessionCommand, ...] = ()
+    finalized: bool = False
+
+
+class AcceptanceTask(QRunnable):
+    def __init__(self, root: Path, library_ids: tuple[str, ...], filesystem_access=None,
+                 restore_records: tuple[SessionRecoveryRecord, ...] = (), *, finalize: bool = False) -> None:
+        super().__init__()
+        self.root, self.library_ids = root, tuple(dict.fromkeys(library_ids))
+        self.filesystem_access = filesystem_access
+        self.task_id = uuid.uuid4().hex
+        self.signals = WorkerSignals()
+        self.result: AcceptanceResult | None = None
+        self.restore_records = restore_records
+        self.finalize = finalize
+        self._stop_event = Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        accepted, error = (), ""
+        restored = []
+        try:
+            context = self.filesystem_access() if self.filesystem_access is not None else nullcontext()
+            with context:
+                if self._stop_event.is_set():
+                    raise InterruptedError("Acceptance canceled; recovery data retained.")
+                for record in self.restore_records:
+                    for command in reversed(record.commands):
+                        if self._stop_event.is_set():
+                            raise InterruptedError("Restoration canceled; recovery data retained.")
+                        ids = {name.casefold(): track_id for track_id, name in command.after_names}
+                        audit = audit_folder(record.folder, command.playlist_path, OrderAuthority.FILENAMES, ids)
+                        plan = build_session_change_plan(audit, command, to_after=False)
+                        result = apply_change_plan(plan)
+                        if not result.success:
+                            raise OSError(result.message + " " + " ".join(result.details))
+                        restored.append(command)
+                accepted = SessionManager(self.root).accept_libraries(self.library_ids, self._stop_event.is_set, finalize=self.finalize)
+        except Exception as exc:
+            _LOG.exception("Session acceptance failed")
+            error = str(exc)
+        self.result = AcceptanceResult(self.task_id, accepted, self.library_ids, error, tuple(restored), self.finalize)
+        self.signals.acceptanceDone.emit(self.result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +137,7 @@ class AuditWorkerResult:
     audit: AuditResult | None
     artwork: bytes | PreparedArtwork | None
     error: str = ""
+    task_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +145,7 @@ class MetadataWorkerResult:
     generation: int
     track_id: str
     metadata: TrackMetadata
+    task_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +177,7 @@ class AuditTask(QRunnable):
         remembered_playlist: str = "",
     ) -> None:
         super().__init__()
+        self.task_id = uuid.uuid4().hex
         self.generation = generation
         self.folder = folder
         self.playlist = playlist
@@ -126,12 +227,12 @@ class AuditTask(QRunnable):
         except Exception as exc:
             _LOG.exception("Library audit failed")
             self.signals.auditReady.emit(
-                AuditWorkerResult(self.generation, None, None, str(exc))
+                AuditWorkerResult(self.generation, None, None, str(exc), self.task_id)
             )
             return
         if not self._stop_event.is_set():
             self.signals.auditReady.emit(
-                AuditWorkerResult(self.generation, result, artwork)
+                AuditWorkerResult(self.generation, result, artwork, task_id=self.task_id)
             )
 
     def stop(self) -> None:
@@ -151,6 +252,7 @@ class MetadataTask(QRunnable):
         filesystem_access=None,
     ) -> None:
         super().__init__()
+        self.task_id = uuid.uuid4().hex
         self.generation, self.track_id, self.path = generation, track_id, path
         self.size, self.mtime_ns = size, mtime_ns
         self.fallback_artwork = fallback_artwork
@@ -224,7 +326,7 @@ class MetadataTask(QRunnable):
             )
         if not self._stop_event.is_set():
             self.signals.metadataReady.emit(
-                MetadataWorkerResult(self.generation, self.track_id, value)
+                MetadataWorkerResult(self.generation, self.track_id, value, self.task_id)
             )
 
     def stop(self) -> None:
@@ -238,20 +340,24 @@ class PlanTask(QRunnable):
         self.filesystem_access = filesystem_access
         self.task_id = uuid.uuid4().hex
         self.signals = WorkerSignals()
+        self._stop_event = Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
 
     @Slot()
     def run(self) -> None:
         try:
             context = self.filesystem_access() if self.filesystem_access is not None else nullcontext()
             with context:
-                plan = self.builder()
+                plan = None if self._stop_event.is_set() else self.builder()
         except Exception as exc:
             _LOG.exception("Change planning failed")
             self.signals.planReady.emit(
                 PlanWorkerResult(self.task_id, None, str(exc))
             )
             return
-        self.signals.planReady.emit(PlanWorkerResult(self.task_id, plan))
+        self.signals.planReady.emit(PlanWorkerResult(self.task_id, None if self._stop_event.is_set() else plan))
 
 
 class TransactionTask(QRunnable):
