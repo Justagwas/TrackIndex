@@ -3,7 +3,7 @@
 <div align="center">
 
 [![Code: GitHub](https://img.shields.io/badge/Code-GitHub-111827.svg?style=flat&logo=github&logoColor=white)](https://github.com/Justagwas/TrackIndex)
-[![Website](https://img.shields.io/badge/Website-TrackIndex-0ea5e9.svg?style=flat&logo=google-chrome&logoColor=white)](https://www.justagwas.com/projects/trackindex)
+[![Website](https://img.shields.io/badge/Website-TrackIndex-0ea5e9.svg?style=flat&logo=google-chrome&logoColor=white)](https://www.justagwas.com/projects/trackindex/)
 [![Mirror: SourceForge](https://img.shields.io/badge/Mirror-SourceForge-ff6600.svg?style=flat&logo=sourceforge&logoColor=white)](https://sourceforge.net/projects/trackindex/)
 
 </div>
@@ -25,7 +25,7 @@
 
 <p align="center"><b>Your Local Music Library Manager & Player</b></p>
 
-<p align="center">Windows music library organizer and local audio player that keeps playlist order synchronized</p>
+<p align="center">Arrange music by dragging tracks, and keep the order in filenames, playlists, or both.</p>
 
 <div align="center">
 
@@ -40,65 +40,67 @@
 
 ## Overview
 
-TrackIndex is a Windows application for organizing and playing music stored in local folders. Add a folder as a library, arrange its tracks in the order you want, and listen without moving between a file manager, playlist editor, and separate music player.
+Open a music folder or create a playlist, then drag your tracks into the order you want. Listen as you organize, and undo or redo library changes while TrackIndex is open.
 
-TrackIndex can keep numbered filenames and a chosen M3U or M3U8 playlist aligned with the order on screen, helping the collection remain useful across different players and devices. Multiple libraries stay close at hand, while artwork and music details make each folder pleasant to browse. Everything happens locally without an account or library upload, and the tags inside your audio files remain untouched.
-
-## Basic usage
-
-1. Download and install from the [latest release](https://github.com/Justagwas/TrackIndex/releases/latest/download/TrackIndexSetup.exe).
-2. Launch TrackIndex.
-3. Open a music folder or add a library discovered under the Windows Music folder.
-4. Follow the short setup to choose whether its order should be stored in filenames, a playlist, or both.
-5. Select one or several tracks and drag them into position.
-6. Double-click a track or use its artwork control to begin listening.
-7. Use the player to seek, adjust volume, shuffle the library, or choose a repeat mode.
-8. Drop audio into the list to import it, or remove tracks you no longer want in the library.
-9. Use **Ctrl+Z** and **Ctrl+Shift+Z** to undo or redo changes during the session.
+Want that order to appear in File Explorer too? TrackIndex can add numbers to your filenames so the tracks appear in your chosen sequence when sorted by **Name**. You can also save the order in a playlist file for music players that support it, without renaming your tracks.
 
 ## Features
 
-- A focused sidebar for keeping multiple folder-based music libraries within reach.
-- Smooth drag and drop ordering for one track or a complete selection.
-- Automatic synchronization of numbered filenames and M3U or M3U8 playlists.
-- Clear guidance when filenames and playlist order disagree.
-- Artwork, title, artist, album, and duration display without changing embedded tags.
-- A responsive local player with seeking, volume, shuffle, repeat, and source format details.
-- Keyboard shortcuts and compatible Windows media controls for playback while TrackIndex is in the background.
-- Support for MP3, WAV, FLAC, OGG, OPUS, M4A, AAC, WMA, AIFF, and AIF files.
-- Audio import, track removal, undo, redo, and interrupted-operation recovery.
-- Local operation without an account or library upload.
+- **Music folders and playlists:** Several local libraries within reach, with playlist creation and support for common audio formats.
+- **Drag-and-drop ordering:** Individual tracks or whole selections moved together.
+- **Order beyond the app:** Optional numbered filenames and M3U/M3U8 playlist files.
+- **Built-in music player:** Artwork, track details, seeking, shuffle, repeat and a compact view.
+- **Undo and redo:** Reordering, added or removed tracks, and playlist changes while TrackIndex is open.
+- **Background loading:** Artwork and track details load as you browse, prioritizing the tracks in view.
+- **Standalone option:** Run without installation, alongside the regular Windows installer.
+
+## Basic usage
+
+1. Get the [Windows installer or standalone app](https://www.justagwas.com/projects/trackindex/). Choose the installer for a normal setup, or standalone to run without installing.
+2. Select **Open Folder** for existing music, or **Create Playlist** for a new folder under the **Music folder** selected in Settings.
+3. Choose **Filename Prefixes** for numbered filenames, **Playlist File** to save the order without renaming tracks, or both.
+4. Drop audio files into the track list to copy them into the library. The original files stay unchanged. Drag one track or a selection into position.
+5. Double-click a track or use its artwork control to listen.
+6. Use **Ctrl+Z** to undo and **Ctrl+Shift+Z** to redo library changes while TrackIndex is open. See [Undo, removal and recovery](#undo-removal-and-recovery) for what happens to removed files.
 
 ## Using TrackIndex
 
-### Put every track in its place
+### Music folders and new playlists
 
-Each TrackIndex library represents one music folder. Rearrange the songs directly in the list, use familiar multi-selection controls when several tracks belong together, and move the complete group in one action.
+Each library uses the audio files directly inside one folder. Subfolders can appear as separate libraries beneath your Music folder; their tracks are not combined into the parent library.
 
-TrackIndex reads music files directly inside the selected folder. This keeps each library predictable and avoids quietly pulling songs from unrelated subfolders into the same order.
+**Create Playlist** creates a new folder and an empty M3U8 playlist under the **Music folder** selected in Settings. Add music by dropping audio files into the track list; imports copy the files and leave the originals intact.
 
-### Keep the order portable
+### Filename and playlist order
 
-Numbered filenames are useful when a device or application sorts by name. M3U and M3U8 playlists preserve an intentional sequence without changing the rest of a filename. TrackIndex can maintain either approach or keep both aligned, allowing the same collection to retain its order across more players and devices.
+Choose **Filename Prefixes** to store order in numbered filenames, **Playlist File** to save it without renumbering audio, or both. For numbered files, sort by **Name** in File Explorer to see the saved sequence. M3U and M3U8 playlists retain playback order in compatible players.
 
-Existing playlist details are preserved where possible. If the folder and playlist disagree, TrackIndex asks which one should be trusted before making a change.
+If an existing playlist and filenames disagree, setup asks which order to use. TrackIndex keeps the selected filenames and playlist references aligned without editing embedded tags or changing audio content.
 
-### Listen without leaving the library
+### Playback and saved order
 
-Start a track from the list and a dedicated player appears with artwork, music details, a timeline, volume, shuffle, repeat, and familiar playback controls. It can be compacted when you want more room for the library or closed when you are finished listening.
+Compact the player to leave more room for the library. Compatible keyboard and Windows media controls also work in the background.
 
-The listening queue follows the latest successfully saved library order without interrupting the current song. Compatible keyboard and Windows media controls also provide access to playback when TrackIndex is in the background.
+Shuffle affects playback only, leaving the saved library order unchanged. After successfully saved library changes, the queue updates while keeping the current song where possible.
 
-### Make changes with confidence
+### Undo, removal and recovery
 
-Renames, imports, removals, and playlist updates are prepared as one coordinated change. Undo and redo remain available throughout the session, and interrupted operations can be recovered safely.
+While TrackIndex is open, you can undo and redo track reordering, filename changes, added or removed tracks, and playlist updates.
 
-Removed audio remains recoverable until the session is accepted. It is then sent to the Windows Recycle Bin rather than being permanently erased without warning.
+Removed audio stays in local recovery storage while TrackIndex is open, so you can undo the removal. On normal close, it goes to the Windows Recycle Bin. If cleanup cannot finish, recovery data is retained for later handling. Interrupted changes are checked on the next start, with recovery options when needed.
+
+### Supported audio formats
+
+MP3, WAV, FLAC, OGG, OPUS, M4A, AAC, WMA, AIFF and AIF.
+
+### Installer and standalone
+
+The standalone executable runs without installation. Both versions store settings in `%LOCALAPPDATA%\TrackIndex`; settings do not travel alongside the executable. Library recovery data stays inside the affected music folder.
 
 ## Project resources
 
-- Project page: <https://www.justagwas.com/projects/trackindex>
-- Download page: <https://www.justagwas.com/projects/trackindex/download>
+- Project page: <https://www.justagwas.com/projects/trackindex/>
+- Download page: <https://www.justagwas.com/projects/trackindex/download/>
 - Releases: <https://github.com/Justagwas/TrackIndex/releases>
 - SourceForge mirror: <https://sourceforge.net/projects/trackindex/>
 
@@ -140,7 +142,7 @@ Publishing scripts, specifications, version resources, installer assets, and rel
 - Windows SmartScreen may display a warning for a new or unsigned release.
 - Obtain TrackIndex only from the official distribution locations:
   - <https://github.com/Justagwas/TrackIndex/releases>
-  - <https://www.justagwas.com/projects/trackindex/download>
+  - <https://www.justagwas.com/projects/trackindex/download/>
   - <https://sourceforge.net/projects/trackindex/>
 - Refer to the repository [Security Policy](https://github.com/Justagwas/TrackIndex/security/policy) for private vulnerability reporting.
 
@@ -155,7 +157,7 @@ Contributions are welcome.
 ## Contact
 
 - Email: [email@justagwas.com](mailto:email@justagwas.com)
-- Website: <https://www.justagwas.com/projects/trackindex>
+- Website: <https://www.justagwas.com/projects/trackindex/>
 
 ## License
 
