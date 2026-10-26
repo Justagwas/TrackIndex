@@ -23,6 +23,7 @@ from .widgets.custom_controls import RoundHandleSliderStyle, SquareCheckBoxStyle
 
 
 class SettingsPanel(QWidget):
+    audioSettingsRequested = Signal()
     uiScaleChanged = Signal(int)
     autoUpdatesChanged = Signal(bool)
     confirmTrackDeletionChanged = Signal(bool)
@@ -107,6 +108,12 @@ class SettingsPanel(QWidget):
         self.scan_button.setObjectName("settingsActionButton")
         self.scan_button.clicked.connect(self.scanLibrariesRequested.emit)
         library_layout.addWidget(self.scan_button)
+
+        audio_card, audio_layout = self._create_settings_card("Playback")
+        audio_button = QPushButton("Audio settings", audio_card)
+        audio_button.setObjectName("settingsActionButton")
+        audio_button.clicked.connect(self.audioSettingsRequested.emit)
+        audio_layout.addWidget(audio_button)
 
         updates_card, updates_layout = self._create_settings_card("Updates")
         self.updates_card = updates_card

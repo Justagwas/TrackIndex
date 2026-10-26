@@ -18,6 +18,12 @@ class BackendEvent:
     generation: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class CrossfadeTransition:
+    outgoing_generation: int
+    incoming_path: Path
+
+
 class PlaybackBackend(Protocol):
     @property
     def available(self) -> bool: ...
@@ -33,7 +39,7 @@ class PlaybackBackend(Protocol):
 
     def set_paused(self, paused: bool) -> None: ...
 
-    def seek(self, seconds: float) -> None: ...
+    def seek(self, seconds: float, *, generation: int | None = None) -> None: ...
 
     def set_volume(self, volume: int) -> None: ...
 
@@ -73,7 +79,7 @@ class UnavailableBackend:
     def set_paused(self, paused: bool) -> None:
         return
 
-    def seek(self, seconds: float) -> None:
+    def seek(self, seconds: float, *, generation: int | None = None) -> None:
         return
 
     def set_volume(self, volume: int) -> None:
@@ -106,6 +112,8 @@ class LibMpvBackend:
         self._requested_current_generation = 0
         self._pending_current_generation = 0
         self._pending_lookahead_generation = 0
+        self._gain_future = None
+        self._gain_volume = None
 
     @property
     def available(self) -> bool:
@@ -262,8 +270,11 @@ class LibMpvBackend:
             self._pending_lookahead_generation = 0
         try:
             player.keep_open = "always" if paused else "no"
+            if paused:
+                player.pause = True
             player.command("loadfile", str(path), "replace")
-            player.pause = bool(paused)
+            if not paused:
+                player.pause = False
         except Exception:
             with self._event_lock:
                 self._pending_current_generation = 0
@@ -276,7 +287,12 @@ class LibMpvBackend:
             with self._event_lock:
                 self._pending_lookahead_generation = generation
             try:
-                player.command("loadfile", str(path), "append")
+                options = getattr(self, "next_file_options", None)
+                if options:
+                    player.command("loadfile", str(path), "append", -1,
+                                   ",".join(f"{key}={value}" for key, value in options.items()))
+                else:
+                    player.command("loadfile", str(path), "append")
             except Exception:
                 with self._event_lock:
                     if self._pending_lookahead_generation == generation:
@@ -298,17 +314,35 @@ class LibMpvBackend:
 
     def set_paused(self, paused: bool) -> None:
         player = self._require_player()
-        if paused:
-            player.keep_open = "always"
+        player.keep_open = "always" if paused else "no"
         player.pause = bool(paused)
-        if not paused:
-            player.keep_open = "no"
 
-    def seek(self, seconds: float) -> None:
+    def seek(self, seconds: float, *, generation: int | None = None) -> None:
+        if generation is not None and generation != self._active_generation():
+            return
         self._require_player().command("seek", max(0.0, float(seconds)), "absolute", "exact")
 
     def set_volume(self, volume: int) -> None:
-        self._require_player().volume = max(0, min(100, int(volume)))
+        value = max(0.0, min(100.0, float(volume)))
+        self._require_player().volume = value
+        self._gain_volume = value
+
+    def set_gain(self, decibels: float, volume: float, *, immediate: bool = False) -> bool:
+        future = self._gain_future
+        if future is not None:
+            if not future.done() and not immediate:
+                return False
+            if future.done():
+                self._gain_future = None
+                future.result()
+        player = self._require_player()
+        if immediate:
+            player.volume_gain = decibels
+        else:
+            self._gain_future = player.command_async("set", "volume-gain", decibels)
+        if self._gain_volume != volume:
+            self.set_volume(volume)
+        return True
 
     def set_muted(self, muted: bool) -> None:
         self._require_player().mute = bool(muted)
@@ -323,6 +357,9 @@ class LibMpvBackend:
         player = self._require_player()
         self._remove_lookahead()
         player.command("stop")
+
+    def wait_until_idle(self) -> None:
+        self._require_player().wait_for_property("idle-active", timeout=1)
 
     def shutdown(self) -> None:
         with self._event_lock:
@@ -341,6 +378,8 @@ class LibMpvBackend:
             with suppress(Exception):
                 player.terminate()
         self._player = None
+        self._gain_future = None
+        self._gain_volume = None
         self._observers.clear()
         self._event_handler = None
         with self._event_lock:
@@ -365,8 +404,8 @@ def native_runtime_folder() -> Path:
 
 
 def create_playback_backend() -> PlaybackBackend:
-    backend = LibMpvBackend()
-    return backend
+    from .listening_backend import ListeningBackend
+    return ListeningBackend()
 
 
 def _integer_value(value: object) -> int | None:

@@ -8,11 +8,12 @@ from pathlib import Path
 from time import monotonic
 from typing import Protocol
 
-from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QLineEdit, QPlainTextEdit, QTextEdit, QWidget
+from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit, QWidget
 
 from trackindex.core.config import SUPPORTED_AUDIO_EXTENSIONS
+from trackindex.core.audio_settings import AudioSettings
 from trackindex.core.config_service import AppConfig, save_config
 from trackindex.core.diagnostics import diagnostics_logger
 from trackindex.core.models import (
@@ -31,9 +32,10 @@ from trackindex.core.playback import (
     RepeatMode,
     SourceAudioInfo,
 )
-from trackindex.core.playback_backend import BackendEvent, PlaybackBackend, create_playback_backend
+from trackindex.core.playback_backend import BackendEvent, CrossfadeTransition, PlaybackBackend, create_playback_backend
 from trackindex.core.threading_contract import assert_qt_thread_affinity
 from trackindex.ui.main_window import MainWindow
+from trackindex.workers.library_workers import MetadataTask, MetadataWorkerResult
 
 from .system_media import MediaContext, MediaPublication, SystemMediaBridge
 
@@ -42,6 +44,14 @@ _LOG = diagnostics_logger("playback")
 
 @dataclass(frozen=True, slots=True)
 class _PendingPosition:
+    generation: int
+    library_id: str
+    track_id: str
+    seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingResume:
     generation: int
     library_id: str
     track_id: str
@@ -59,6 +69,10 @@ class PlaybackLibraryCoordinator(Protocol):
     def library_loading(self) -> bool: ...
 
     def select_library(self, library_id: str) -> None: ...
+
+    def create_playback_artwork_task(
+        self, generation: int, track_id: str, path: Path,
+    ) -> MetadataTask: ...
 
 
 class PlaybackWorker(QObject):
@@ -94,7 +108,8 @@ class PlaybackWorker(QObject):
             if command == "load":
                 self.eventReady.emit(BackendEvent("error", str(exc), int(generation)))
             elif command == "prepare-mutation":
-                self.eventReady.emit(BackendEvent("mutation-failed", (str(value), str(exc))))
+                token = value[0] if isinstance(value, tuple) and len(value) == 2 else value
+                self.eventReady.emit(BackendEvent("mutation-failed", (str(token), str(exc))))
             elif command == "recover-output":
                 try:
                     generation = int(str(value))
@@ -118,6 +133,8 @@ class PlaybackWorker(QObject):
             "stop": self._execute_stop,
             "prepare-mutation": self._execute_mutation_preparation,
             "shutdown": self._execute_shutdown,
+            "audio-settings": self._execute_audio_settings,
+            "audio-devices": self._execute_audio_devices,
         }
         handler = handlers.get(command)
         if handler is None:
@@ -161,11 +178,15 @@ class PlaybackWorker(QObject):
         return 0
 
     def _execute_seek(self, value: object) -> int:
-        seconds = _finite_float(value)
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            raise ValueError("Playback seek command is malformed.")
+        raw_seconds, raw_generation = value
+        seconds = _finite_float(raw_seconds)
         if seconds is None:
             raise ValueError("Playback seek position is malformed.")
-        self.backend.seek(seconds)
-        return 0
+        generation = int(raw_generation)
+        self.backend.seek(seconds, generation=generation)
+        return generation
 
     def _execute_volume(self, value: object) -> int:
         self.backend.set_volume(int(str(value)))
@@ -186,9 +207,23 @@ class PlaybackWorker(QObject):
         return 0
 
     def _execute_mutation_preparation(self, value: object) -> int:
-        token = str(value)
-        self.backend.set_lookahead(None)
-        self.eventReady.emit(BackendEvent("mutation-ready", token))
+        token, expected = value if isinstance(value, tuple) and len(value) == 2 else (str(value), None)
+        interrupted = False
+        if hasattr(self.backend, "prepare_mutation"):
+            interrupted = self.backend.prepare_mutation(expected_generation=expected)
+        else:
+            self.backend.set_lookahead(None)
+        self.eventReady.emit(BackendEvent("mutation-ready", (str(token), True) if interrupted else str(token)))
+        return 0
+
+    def _execute_audio_settings(self, value: object) -> int:
+        if isinstance(value, AudioSettings) and hasattr(self.backend, "configure_audio"):
+            self.backend.configure_audio(value)
+        return 0
+
+    def _execute_audio_devices(self, _value: object) -> int:
+        if hasattr(self.backend, "refresh_devices"):
+            self.backend.refresh_devices()
         return 0
 
     def _execute_shutdown(self, _value: object) -> int:
@@ -232,9 +267,17 @@ class PlaybackController(QObject):
         self._intentional_stop = False
         self._stopping = False
         self._error_attempts = 0
+        self._audio_panel = None
+        self._audio_devices = []
+        self._deferred_audio_baseline: AudioSettings | None = None
+        self._artwork_pool = QThreadPool(self)
+        self._artwork_pool.setMaxThreadCount(1)
+        self._artwork_request: tuple[MetadataTask, MediaContext, Path] | None = None
         self._output_recovery_attempts = 0
-        self._output_recovery_entry_id = ""
+        self._output_recovery_identity: tuple[str, str] | None = None
+        self._output_recovery_owner: MediaContext | None = None
         self._output_recovery_message = ""
+        self._deferred_output_recovery: tuple[MediaContext, str] | None = None
         self._backend_lookahead_id = ""
         self._backend_lookahead_generation = 0
         self._next_backend_generation = 1
@@ -242,7 +285,7 @@ class PlaybackController(QObject):
         self._awaiting_prefetched_load = False
         self._ignore_ended_until_loaded = False
         self._play_after_load = True
-        self._seek_after_load: float | None = None
+        self._pending_resume: _PendingResume | None = None
         self._mutation_callbacks: dict[
             str,
             tuple[Callable[[], None], Callable[[str], None] | None],
@@ -329,6 +372,54 @@ class PlaybackController(QObject):
         panel.closeRequested.connect(lambda: self.dispatch_transport("close"))
         panel.presentationRequested.connect(self.set_presentation)
         panel.currentTrackRequested.connect(self.reveal_current_track)
+        panel.audioSettingsRequested.connect(self.toggle_audio_settings)
+        self.window.settings_panel.audioSettingsRequested.connect(self.show_audio_settings)
+
+    def show_audio_settings(self) -> None:
+        if self._stopping:
+            return
+        if self._audio_panel is None:
+            self._audio_panel = self.window.ensure_audio_panel()
+            self._audio_panel.settingsChanged.connect(self.set_audio_settings)
+        if self.window._requested_surface != "audio":
+            self._audio_panel.flush_pending_changes()
+            self._audio_panel.set_settings(self.config.audio)
+        self._audio_panel.set_devices(self._audio_devices)
+        self._audio_panel.set_output(self.snapshot.output)
+        self.window.show_audio_panel()
+        self.commandRequested.emit("audio-devices", None)
+
+    def toggle_audio_settings(self) -> None:
+        if self.window._requested_surface == "audio":
+            self.window.hide_audio_panel()
+        else:
+            self.show_audio_settings()
+
+    @Slot(object)
+    def set_audio_settings(self, settings: AudioSettings) -> None:
+        if self._stopping:
+            return
+        previous = self.config.audio
+        self.config.audio = settings
+        self._config_timer.start()
+        if self._mutation_library_id:
+            if self._deferred_audio_baseline is None:
+                self._deferred_audio_baseline = previous
+            return
+        self.commandRequested.emit("audio-settings", settings)
+        if settings.device != previous.device and self.snapshot.entry is not None:
+            entry = self.snapshot.entry
+            if self.snapshot.state in {PlaybackState.PLAYING, PlaybackState.PAUSED, PlaybackState.LOADING}:
+                self._load_entry(entry, paused=self.snapshot.state is PlaybackState.PAUSED,
+                                 resume_position=self.snapshot.position_seconds)
+
+    def _flush_deferred_audio_settings(self) -> bool:
+        previous = self._deferred_audio_baseline
+        self._deferred_audio_baseline = None
+        if self._stopping or previous is None or previous == self.config.audio:
+            return False
+        self.commandRequested.emit("audio-settings", self.config.audio)
+        return previous.device != self.config.audio.device
 
     def _install_shortcuts(self) -> None:
         bindings = (
@@ -395,7 +486,8 @@ class PlaybackController(QObject):
             and watched.window() is self.window
             and self.snapshot.entry is not None
             and self.snapshot.presentation is not PlayerPresentation.HIDDEN
-            and not isinstance(self.app.focusWidget(), (QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox))
+            and not self.window.audio_owns_widget(self.app.focusWidget())
+            and not isinstance(self.app.focusWidget(), (QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox, QComboBox))
             and self.app.activeModalWidget() is None
             and self.app.activePopupWidget() is None
         ):
@@ -525,8 +617,31 @@ class PlaybackController(QObject):
     def _valid_entry(entry: QueueEntry) -> bool:
         return entry.path.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS
 
-    def _load_entry(self, entry: QueueEntry, *, paused: bool = False) -> None:
+    def _clear_resume_intent(self, *, preserve_deferred_recovery: bool = False) -> None:
+        if not preserve_deferred_recovery:
+            self._deferred_output_recovery = None
+        self._pending_resume = None
+        self._output_recovery_owner = None
+        self._output_recovery_identity = None
+        self._output_recovery_attempts = 0
+        self._output_recovery_message = ""
+
+    def _owned_resume(self) -> _PendingResume | None:
+        pending = self._pending_resume
+        if pending is not None and (pending.generation, pending.library_id, pending.track_id) == self._media_context():
+            return pending
+        return None
+
+    def _load_entry(
+        self, entry: QueueEntry, *, paused: bool = False,
+        resume_position: float | None = None, recovering: bool = False,
+    ) -> None:
         self._clear_pending_position()
+        if not recovering:
+            self._clear_resume_intent()
+        else:
+            self._pending_resume = None
+            self._output_recovery_owner = None
         self._intentional_stop = False
         self._awaiting_prefetched_load = False
         self._ignore_ended_until_loaded = True
@@ -547,8 +662,50 @@ class PlaybackController(QObject):
         self.window.track_table.set_playback_state(entry.track_id, not paused)
         generation = self._new_backend_generation()
         self._active_backend_generation = generation
+        position = _finite_float(resume_position)
+        if position is not None:
+            self._pending_resume = _PendingResume(generation, entry.library_id, entry.track_id, max(0.0, position))
         self.commandRequested.emit("load", (str(entry.path), paused, generation))
+        self._request_current_artwork()
         self._refresh_lookahead()
+
+    def _cancel_artwork_request(self) -> None:
+        if self._artwork_request is not None:
+            self._artwork_request[0].stop()
+            self._artwork_request = None
+        self._artwork_pool.clear()
+
+    def _request_current_artwork(self) -> None:
+        self._cancel_artwork_request()
+        entry = self.snapshot.entry
+        if self._stopping or self._mutation_library_id or entry is None or entry.artwork_bytes:
+            return
+        task = self.app_controller.create_playback_artwork_task(
+            self._active_backend_generation, entry.track_id, entry.path,
+        )
+        self._artwork_request = (task, self._media_context(), entry.path)
+        task.signals.metadataReady.connect(self._artwork_ready)
+        self._artwork_pool.start(task)
+
+    @Slot(object)
+    def _artwork_ready(self, event: MetadataWorkerResult) -> None:
+        assert_qt_thread_affinity(self)
+        request = self._artwork_request
+        if request is None or event.task_id != request[0].task_id:
+            return
+        self._artwork_request = None
+        entry = self.snapshot.entry
+        if (
+            self._stopping or self._mutation_library_id or entry is None
+            or request[1] != self._media_context() or request[2] != entry.path
+            or event.generation != self._active_backend_generation
+            or event.track_id != entry.track_id or not event.metadata.artwork_bytes
+        ):
+            return
+        self.snapshot = replace(
+            self.snapshot, entry=replace(entry, artwork_bytes=event.metadata.artwork_bytes),
+        )
+        self._publish_playback_snapshot()
 
     def _new_backend_generation(self) -> int:
         generation = self._next_backend_generation
@@ -592,10 +749,13 @@ class PlaybackController(QObject):
             return
         self._load_entry(entry, paused=paused)
 
-    def _adopt_prefetched_entry(self, entry: QueueEntry, *, paused: bool = False) -> None:
+    def _adopt_prefetched_entry(
+        self, entry: QueueEntry, *, paused: bool = False, generation: int | None = None,
+    ) -> None:
         self._clear_pending_position()
+        self._clear_resume_intent()
         self._backend_lookahead_id = ""
-        self._active_backend_generation = self._backend_lookahead_generation
+        self._active_backend_generation = self._backend_lookahead_generation if generation is None else generation
         self._backend_lookahead_generation = 0
         self._awaiting_prefetched_load = True
         self._ignore_ended_until_loaded = True
@@ -614,6 +774,7 @@ class PlaybackController(QObject):
         self.window.track_table.set_playback_state(entry.track_id, not paused)
         if paused:
             self.commandRequested.emit("pause", True)
+        self._request_current_artwork()
 
     @Slot()
     def previous(self) -> None:
@@ -626,7 +787,9 @@ class PlaybackController(QObject):
 
     @Slot()
     def stop(self) -> None:
+        self._cancel_artwork_request()
         self._clear_pending_position()
+        self._clear_resume_intent()
         if self.snapshot.entry is None:
             return
         entry = self.snapshot.entry
@@ -634,9 +797,6 @@ class PlaybackController(QObject):
         self._awaiting_prefetched_load = False
         self._backend_lookahead_id = ""
         self._backend_lookahead_generation = 0
-        self._output_recovery_attempts = 0
-        self._output_recovery_entry_id = ""
-        self._output_recovery_message = ""
         self._active_backend_generation = self._new_backend_generation()
         self.commandRequested.emit("stop", None)
         self.snapshot = replace(
@@ -652,14 +812,13 @@ class PlaybackController(QObject):
 
     @Slot()
     def close(self) -> None:
+        self._cancel_artwork_request()
         self._clear_pending_position()
+        self._clear_resume_intent()
         self._intentional_stop = True
         self._awaiting_prefetched_load = False
         self._backend_lookahead_id = ""
         self._backend_lookahead_generation = 0
-        self._output_recovery_attempts = 0
-        self._output_recovery_entry_id = ""
-        self._output_recovery_message = ""
         self._active_backend_generation = self._new_backend_generation()
         self.commandRequested.emit("stop", None)
         self.queue.clear()
@@ -688,9 +847,12 @@ class PlaybackController(QObject):
         if self.snapshot.duration_seconds is not None:
             value = min(value, self.snapshot.duration_seconds)
         self._clear_pending_position()
+        pending = self._owned_resume()
+        if pending is not None:
+            self._pending_resume = replace(pending, seconds=value)
         self.snapshot = replace(self.snapshot, position_seconds=value)
         self.window.player_panel.set_snapshot(self.snapshot)
-        self.commandRequested.emit("seek", value)
+        self.commandRequested.emit("seek", (value, self._active_backend_generation))
 
     @Slot(int)
     def set_volume(self, volume: int) -> None:
@@ -791,6 +953,9 @@ class PlaybackController(QObject):
         assert_qt_thread_affinity(self)
         if self._stopping:
             return
+        if event.kind == "crossfade-started":
+            self._adopt_crossfade(event)
+            return
         if self._stale_backend_event(event):
             return
         if self._handle_worker_event(event):
@@ -800,6 +965,24 @@ class PlaybackController(QObject):
         if not self._apply_playback_event(event):
             return
         self._publish_playback_snapshot()
+
+    def _adopt_crossfade(self, event: BackendEvent) -> None:
+        transition = event.value
+        current = self.snapshot.entry
+        if (not isinstance(transition, CrossfadeTransition) or self._mutation_library_id
+                or current is None or transition.outgoing_generation != self._active_backend_generation):
+            return
+        incoming = next((entry for entry in self.queue.entries
+                         if entry.library_id == current.library_id and entry.path == transition.incoming_path), None)
+        if incoming is not None:
+            self.queue.adopt(incoming.track_id)
+            self._adopt_prefetched_entry(incoming, paused=self.snapshot.state is PlaybackState.PAUSED,
+                                        generation=event.generation)
+        elif self.queue.current is not None:
+            self._load_entry(self.queue.current, paused=self.snapshot.state is PlaybackState.PAUSED,
+                             resume_position=self.snapshot.position_seconds)
+        else:
+            self.stop()
 
     def _stale_backend_event(self, event: BackendEvent) -> bool:
         return event.kind in {
@@ -824,8 +1007,17 @@ class PlaybackController(QObject):
         kind, value = event.kind, event.value
         if kind == "ready":
             self._available = True
+            self.commandRequested.emit("audio-settings", self.config.audio)
             self.commandRequested.emit("volume", self.snapshot.volume)
             self.commandRequested.emit("mute", self.snapshot.muted)
+            return True
+        if kind == "devices":
+            self._audio_devices = value if isinstance(value, list) else []
+            if self._audio_panel is not None:
+                self._audio_panel.set_devices(self._audio_devices)
+            return True
+        if kind == "audio-notice":
+            self.window.show_toast(str(value), None)
             return True
         if kind == "unavailable":
             self._available = False
@@ -835,7 +1027,10 @@ class PlaybackController(QObject):
                 self.close()
             return True
         if kind == "mutation-ready":
-            self._mutation_ready(str(value))
+            if isinstance(value, tuple) and len(value) == 2:
+                self._mutation_ready(str(value[0]), interrupted=bool(value[1]))
+            else:
+                self._mutation_ready(str(value))
             return True
         if kind == "mutation-failed":
             if isinstance(value, tuple) and len(value) == 2:
@@ -851,6 +1046,12 @@ class PlaybackController(QObject):
 
     def _handle_output_event(self, event: BackendEvent) -> bool:
         kind, value = event.kind, event.value
+        if self._mutation_library_id and kind in {"output-error", "output-recovered", "output-recovery-failed"}:
+            self._deferred_output_recovery = (
+                self._media_context(),
+                str(value or self._output_recovery_message or "The audio output device is unavailable."),
+            )
+            return True
         if kind == "output-error":
             entry = self.snapshot.entry
             if entry is not None:
@@ -861,8 +1062,10 @@ class PlaybackController(QObject):
             return True
         if kind == "output-recovered":
             entry = self.snapshot.entry
-            if entry is not None and entry.track_id == self._output_recovery_entry_id:
-                self._load_entry(entry, paused=not self._play_after_load)
+            pending = self._owned_resume()
+            if entry is not None and self._output_recovery_owner == self._media_context():
+                self._load_entry(entry, paused=not self._play_after_load,
+                                 resume_position=pending.seconds if pending else None, recovering=True)
             return True
         if kind == "output-recovery-failed":
             self._retry_output_recovery()
@@ -905,16 +1108,11 @@ class PlaybackController(QObject):
         self.snapshot = replace(self.snapshot, state=state, loading=False)
         self._play_requested_before_ready = False
         self._error_attempts = 0
-        self._output_recovery_attempts = 0
-        self._output_recovery_entry_id = ""
-        self._output_recovery_message = ""
         self.commandRequested.emit("pause", not self._play_after_load)
-        if self._seek_after_load is not None:
-            self._clear_pending_position()
-            position = self._seek_after_load
-            self._seek_after_load = None
-            self.snapshot = replace(self.snapshot, position_seconds=position)
-            self.commandRequested.emit("seek", position)
+        pending = self._owned_resume()
+        self._clear_resume_intent(preserve_deferred_recovery=True)
+        if pending is not None:
+            self.seek(pending.seconds)
         if self._awaiting_prefetched_load or restored:
             self._awaiting_prefetched_load = False
             self._refresh_lookahead()
@@ -1011,6 +1209,8 @@ class PlaybackController(QObject):
 
     def _publish_playback_snapshot(self) -> None:
         self.window.player_panel.set_snapshot(self.snapshot)
+        if self._audio_panel is not None:
+            self._audio_panel.set_output(self.snapshot.output)
         if self.snapshot.entry is not None:
             self.window.track_table.set_playback_state(
                 self.snapshot.entry.track_id,
@@ -1041,7 +1241,10 @@ class PlaybackController(QObject):
             return
         replacement = replace(entry, source=source)
         self.snapshot = replace(self.snapshot, entry=replacement)
-        self.queue.entries = tuple(replacement if item.track_id == replacement.track_id else item for item in self.queue.entries)
+        self.queue.entries = tuple(
+            replace(item, source=source) if item.track_id == entry.track_id else item
+            for item in self.queue.entries
+        )
 
     def _update_source_params(self, value: object) -> None:
         if self.snapshot.entry is None or not isinstance(value, dict):
@@ -1070,6 +1273,7 @@ class PlaybackController(QObject):
         self.snapshot = replace(self.snapshot, output=output)
 
     def _handle_entry_error(self, entry: QueueEntry, message: str) -> None:
+        self._clear_resume_intent()
         self.queue.mark_unavailable(entry.track_id)
         self._error_attempts += 1
         self.window.show_toast(f"Could not play {entry.title}; skipping", None)
@@ -1080,12 +1284,19 @@ class PlaybackController(QObject):
         self.next(natural=True)
 
     def _begin_output_recovery(self, entry: QueueEntry, message: str) -> None:
-        if self._output_recovery_entry_id != entry.track_id:
+        identity = (entry.library_id, entry.track_id)
+        if self._output_recovery_identity != identity:
             self._output_recovery_attempts = 0
-        self._output_recovery_entry_id = entry.track_id
+        self._output_recovery_identity = identity
+        self._output_recovery_owner = self._media_context()
         self._output_recovery_message = message
-        self._play_after_load = self.snapshot.state is not PlaybackState.PAUSED
-        self._seek_after_load = self.snapshot.position_seconds
+        pending = self._owned_resume()
+        if pending is None:
+            self._play_after_load = self.snapshot.state is not PlaybackState.PAUSED
+            position = _finite_float(self.snapshot.position_seconds)
+            if position is not None:
+                self._pending_resume = _PendingResume(self._active_backend_generation,
+                                                      *identity, max(0.0, position))
         self.snapshot = replace(
             self.snapshot,
             state=PlaybackState.LOADING,
@@ -1096,7 +1307,10 @@ class PlaybackController(QObject):
         self._request_output_recovery()
 
     def _request_output_recovery(self) -> None:
-        if self._stopping or not self._output_recovery_entry_id:
+        if self._stopping or self._output_recovery_owner != self._media_context():
+            return
+        if self._mutation_library_id:
+            self._deferred_output_recovery = (self._media_context(), self._output_recovery_message)
             return
         if self._output_recovery_attempts >= 3:
             self.window.show_toast(self._output_recovery_message, None)
@@ -1108,18 +1322,32 @@ class PlaybackController(QObject):
             self._active_backend_generation,
         )
 
+    def _resume_deferred_output_recovery(self) -> bool:
+        pending = self._deferred_output_recovery
+        self._deferred_output_recovery = None
+        if (pending is None or self._stopping or pending[0] != self._media_context()
+                or self.snapshot.entry is None
+                or self.snapshot.state not in {PlaybackState.LOADING, PlaybackState.PLAYING, PlaybackState.PAUSED}):
+            return False
+        self._begin_output_recovery(self.snapshot.entry, pending[1])
+        return True
+
     def _retry_output_recovery(self) -> None:
         if self._output_recovery_attempts >= 3:
             self._request_output_recovery()
             return
         generation = self._active_backend_generation
-        track_id = self._output_recovery_entry_id
+        owner = self._output_recovery_owner
+        attempt = self._output_recovery_attempts
 
         def retry() -> None:
             if (
                 not self._stopping
                 and generation == self._active_backend_generation
-                and track_id == self._output_recovery_entry_id
+                and attempt == self._output_recovery_attempts
+                and owner is not None
+                and owner == self._output_recovery_owner
+                and owner == self._media_context()
             ):
                 self._request_output_recovery()
 
@@ -1136,18 +1364,21 @@ class PlaybackController(QObject):
         if active is None or active.library_id != library_id:
             QTimer.singleShot(0, callback)
             return
+        self._cancel_artwork_request()
         token = uuid.uuid4().hex
         self._mutation_callbacks[token] = (callback, error_callback)
         self._mutation_library_id = library_id
         self._mutation_current_id = self.queue.current_id
         self._mutation_position = self.snapshot.position_seconds
-        self._mutation_was_playing = self.snapshot.state is PlaybackState.PLAYING
+        self._mutation_was_playing = (self._play_after_load if self.snapshot.state is PlaybackState.LOADING
+                                      else self.snapshot.state is PlaybackState.PLAYING)
         self._mutation_active = self.snapshot.state in {
             PlaybackState.LOADING,
             PlaybackState.PLAYING,
             PlaybackState.PAUSED,
         }
         self._mutation_successor = self.queue.peek_next_id()
+        expected_generation = self._active_backend_generation
         departing = {
             item.track_id
             for item in plan.presence
@@ -1158,12 +1389,13 @@ class PlaybackController(QObject):
         )
         if self._mutation_unloaded_current:
             self._clear_pending_position()
+            self._clear_resume_intent()
             self._intentional_stop = True
             self._backend_lookahead_id = ""
             self._backend_lookahead_generation = 0
             self._active_backend_generation = self._new_backend_generation()
             self.commandRequested.emit("stop", None)
-        self.commandRequested.emit("prepare-mutation", token)
+        self.commandRequested.emit("prepare-mutation", (token, expected_generation))
         QTimer.singleShot(
             2000,
             lambda token=token: self._mutation_failed(
@@ -1172,9 +1404,11 @@ class PlaybackController(QObject):
             ),
         )
 
-    def _mutation_ready(self, token: str) -> None:
+    def _mutation_ready(self, token: str, *, interrupted: bool = False) -> None:
         callbacks = self._mutation_callbacks.pop(token, None)
         if callbacks is not None:
+            if interrupted:
+                self._mutation_unloaded_current = True
             callbacks[0]()
 
     def _mutation_failed(self, token: str, message: str) -> None:
@@ -1182,6 +1416,7 @@ class PlaybackController(QObject):
         if callbacks is None:
             return
         self._mutation_library_id = ""
+        self._mutation_unloaded_current |= self._mutation_active
         self._restore_prepared_playback()
         failed = callbacks[1]
         if failed is not None:
@@ -1190,14 +1425,18 @@ class PlaybackController(QObject):
             self.window.show_toast(message, None)
 
     def _restore_prepared_playback(self) -> None:
-        if self._mutation_unloaded_current:
+        device_changed = self._flush_deferred_audio_settings()
+        if self._mutation_unloaded_current or (device_changed and self._mutation_active):
             current = self.queue.entry(self._mutation_current_id)
             if current is not None and self._valid_entry(current):
-                self._seek_after_load = self._mutation_position
-                self._load_entry(current, paused=not self._mutation_was_playing)
+                self._load_entry(current, paused=not self._mutation_was_playing,
+                                 resume_position=(self._mutation_position if self._mutation_unloaded_current
+                                                  else self.snapshot.position_seconds))
         self._mutation_unloaded_current = False
         self._mutation_active = False
-        self._refresh_lookahead()
+        if not self._resume_deferred_output_recovery():
+            self._refresh_lookahead()
+        self._request_current_artwork()
 
     def complete_filesystem_mutation(
         self,
@@ -1225,6 +1464,7 @@ class PlaybackController(QObject):
             ordered = tuple(by_id[item] for item in plan.ordered_track_ids if item in by_id)
             self.queue.reconcile(ordered)
         current = self.queue.current
+        device_changed = self._flush_deferred_audio_settings()
         if current is None and self._mutation_successor:
             successor = self.queue.entry(self._mutation_successor)
             if successor is not None:
@@ -1242,17 +1482,25 @@ class PlaybackController(QObject):
                         loading=False,
                     )
                     self.window.player_panel.set_snapshot(self.snapshot)
+                    self._request_current_artwork()
                 self._mutation_unloaded_current = False
                 self._mutation_active = False
                 return
         if current is not None:
-            self.snapshot = replace(self.snapshot, entry=current)
-            self.window.player_panel.set_snapshot(self.snapshot)
+            if (self._mutation_unloaded_current or device_changed) and self._mutation_active:
+                self._load_entry(current, paused=not self._mutation_was_playing,
+                                 resume_position=(self._mutation_position if self._mutation_unloaded_current
+                                                  else self.snapshot.position_seconds))
+            else:
+                self.snapshot = replace(self.snapshot, entry=current)
+                self.window.player_panel.set_snapshot(self.snapshot)
         elif self._mutation_active:
             self.close()
         self._mutation_unloaded_current = False
         self._mutation_active = False
-        self._refresh_lookahead()
+        if not self._resume_deferred_output_recovery():
+            self._refresh_lookahead()
+        self._request_current_artwork()
 
     def library_removed(self, library_id: str) -> None:
         entry = self.snapshot.entry
@@ -1267,6 +1515,9 @@ class PlaybackController(QObject):
                 _LOG.exception("Playback preferences could not be saved")
 
     def reset_preferences(self) -> None:
+        self.set_audio_settings(AudioSettings())
+        if self._audio_panel is not None:
+            self._audio_panel.set_settings(self.config.audio)
         self.set_volume(75)
         self.set_muted(False)
         self.set_shuffle(False)
@@ -1275,19 +1526,23 @@ class PlaybackController(QObject):
     def shutdown(self) -> None:
         if self._stopping:
             return
+        self.window.finish_audio_interaction()
         self._stopping = True
+        self._deferred_audio_baseline = None
+        self._cancel_artwork_request()
         self._reveal_request += 1
         self.app.removeEventFilter(self)
         for shortcut in self._shortcuts:
             shortcut.setEnabled(False)
         self._config_timer.stop()
         self._clear_pending_position()
+        self._clear_resume_intent()
         if self._system_media is not None:
             self._system_media.close()
         self.window.player_panel.set_presentation(PlayerPresentation.HIDDEN)
         self.commandRequested.emit("shutdown", None)
     def shutdown_drained(self) -> bool:
-        return self._playback_thread.wait(0)
+        return self._playback_thread.wait(0) and self._artwork_pool.waitForDone(0)
 
     def persist_shutdown_state(self) -> bool:
         try:

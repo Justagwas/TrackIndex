@@ -7,6 +7,7 @@ from PySide6.QtCore import (
     QAbstractAnimation,
     QEasingCurve,
     QEvent,
+    QLineF,
     QPoint,
     QRectF,
     QSize,
@@ -176,6 +177,14 @@ def _icon(
         else:
             painter.drawArc(QRectF(size * 0.49, size * 0.32, size * 0.27, size * 0.36), -55 * 16, 110 * 16)
             painter.drawArc(QRectF(size * 0.45, size * 0.22, size * 0.43, size * 0.56), -52 * 16, 104 * 16)
+    elif name == "audio-settings":
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        radius = size * .085
+        for x, y in ((.38, .35), (.62, .65)):
+            cx, cy = size*x, size*y
+            painter.drawLine(QLineF(size*.24, cy, cx-radius, cy))
+            painter.drawLine(QLineF(cx+radius, cy, size*.76, cy))
+            painter.drawEllipse(QRectF(cx-radius, cy-radius, radius*2, radius*2))
     elif name == "collapse":
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawLine(QPoint(round(size * 0.27), round(size * 0.39)), QPoint(round(center), round(size * 0.61)))
@@ -527,7 +536,7 @@ class PlayerArtwork(QWidget):
 
 class AudioInfoPopup(QFrame):
     def __init__(self, parent=None) -> None:
-        super().__init__(None, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.setObjectName("audioInfoPopup")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
@@ -587,6 +596,9 @@ class PlayerPanel(QFrame):
     closeRequested = Signal()
     presentationRequested = Signal(str)
     currentTrackRequested = Signal()
+    audioSettingsRequested = Signal()
+    audioInfoRequested = Signal()
+    appearanceChanged = Signal()
     resizedDuringAnimation = Signal()
 
     def __init__(self, theme: ThemePalette, scale: float, parent=None) -> None:
@@ -795,6 +807,11 @@ class PlayerPanel(QFrame):
         self.close_button = self._button("close", "Close player")
         self.close_button.setObjectName("playerUtilityButton")
         self.close_button.clicked.connect(self.closeRequested.emit)
+        self.audio_button = self._button("audio-settings", "Audio settings")
+        self.audio_button.setCheckable(True)
+        self.audio_button.setObjectName("playerUtilityButton")
+        self.audio_button.clicked.connect(self.audioSettingsRequested.emit)
+        top_layout.addWidget(self.audio_button)
         top_layout.addWidget(self.collapse_button)
         top_layout.addWidget(self.close_button)
         right_layout.addWidget(top_controls)
@@ -838,6 +855,7 @@ class PlayerPanel(QFrame):
         return button
 
     def set_appearance(self, theme: ThemePalette, scale: float) -> None:
+        old_scale = self.scale
         self.theme = theme
         self.scale = max(0.75, min(2.0, scale))
         self.artwork.theme = theme
@@ -874,7 +892,7 @@ class PlayerPanel(QFrame):
         secondary_size = max(22, round(30 * self.scale))
         primary_size = max(30, round(38 * self.scale))
         mini_primary_size = max(26, round(32 * self.scale))
-        side_width = max(150, mini_primary_size + 4 * secondary_size + 4 * max(3, round(4 * self.scale)))
+        side_width = max(150, mini_primary_size + 5 * secondary_size + 5 * max(3, round(4 * self.scale)))
         self._left.setMinimumWidth(side_width)
         self._right.setMinimumWidth(side_width)
         self._top_layout.setSpacing(max(3, round(4 * self.scale)))
@@ -893,6 +911,7 @@ class PlayerPanel(QFrame):
         utility_height = secondary_size
         self.collapse_button.setFixedSize(utility_width, utility_height)
         self.close_button.setFixedSize(utility_width, utility_height)
+        self.audio_button.setFixedSize(utility_width, utility_height)
         self.play_button.setFixedSize(primary_size, primary_size)
         self.mini_play_button.setFixedSize(mini_primary_size, mini_primary_size)
         self._right_top.setFixedHeight(utility_height)
@@ -914,12 +933,19 @@ class PlayerPanel(QFrame):
         self._last_icon_dpr = 0.0
         self._refresh_icons()
         self._apply_presentation_widgets()
+        if self.scale != old_scale:
+            self._height_animation.stop()
+            self._content_animation.stop()
+            self._set_expansion(1.0 if self.presentation is PlayerPresentation.EXPANDED else 0.0)
+            self._animate_height(self._target_height(self.presentation))
+            self._animation_finished()
         self._info_popup.setStyleSheet(self.window().styleSheet() if self.window() else "")
         for widget in self.findChildren(QWidget):
             if isinstance(widget, (QPushButton, QSlider, PlayerArtwork)) or (
                 isinstance(widget, MetadataLabel) and widget._interactive
             ):
                 sync_pointer_cursor(widget)
+        self.appearanceChanged.emit()
 
     def _device_pixel_ratio(self) -> float:
         screen = self.screen()
@@ -1213,15 +1239,16 @@ class PlayerPanel(QFrame):
     def _show_audio_info(self) -> None:
         if self.snapshot.entry is None or self.presentation is not PlayerPresentation.EXPANDED:
             return
+        self.audioInfoRequested.emit()
         self._info_popup.set_snapshot(self.snapshot)
         gap = max(6, round(10 * self.scale))
-        point = self.mapToGlobal(QPoint(
-            self._metadata.mapTo(self, QPoint(0, 0)).x() - round(20 * self.scale),
-            -self._info_popup.height() - gap,
-        ))
-        screen = QApplication.screenAt(point)
+        anchor = self.mapToGlobal(QPoint(0, 0))
+        point = QPoint(anchor.x(), anchor.y() - self._info_popup.height() - gap)
+        screen = self.screen()
         if screen is not None:
             available = screen.availableGeometry()
+            if point.y() < available.top():
+                point.setY(self.mapToGlobal(QPoint(0, self.height())).y() + gap)
             point.setX(max(available.left(), min(point.x(), available.right() - self._info_popup.width() + 1)))
             point.setY(max(available.top(), min(point.y(), available.bottom() - self._info_popup.height() + 1)))
         self._info_popup.move(point)

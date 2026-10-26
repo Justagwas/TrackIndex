@@ -176,7 +176,8 @@ class LibraryList(QListWidget):
 
 
         self._press_position: QPointF | None = None
-        self._press_item: QListWidgetItem | None = None
+        self._press_library_id = ""
+        self._gesture_cancelled = False
         self._drag: _LibraryDrag | None = None
         self._releasing_mouse = False
         self._filtered_window: QWidget | None = None
@@ -249,14 +250,14 @@ class LibraryList(QListWidget):
         return None
 
     def set_appearance(self, theme: ThemePalette, scale: float) -> None:
-        self._cancel_drag(immediate=True)
+        self._invalidate_gesture()
         self._delegate.set_appearance(theme, scale)
         self.viewport().update()
 
     def set_libraries(
         self, libraries: list[LibraryRecord], selected_id: str = ""
     ) -> None:
-        self._cancel_drag(immediate=True)
+        self._invalidate_gesture()
         previous = self.blockSignals(True)
         self.clear()
         chosen = None
@@ -305,18 +306,24 @@ class LibraryList(QListWidget):
         self._sync_pointer_cursor(point if self.viewport().rect().contains(point) else None)
 
     def mousePressEvent(self, event) -> None:
+        self._gesture_cancelled = False
         if event.button() == Qt.MouseButton.LeftButton and self._drag is None:
             item = self.itemAt(event.position().toPoint())
             if item is not None:
                 self.setFocus(Qt.FocusReason.MouseFocusReason)
                 self._press_position = QPointF(event.position())
-                self._press_item = item
+                self._press_library_id = item.data(LIBRARY_ROLE).library_id
                 event.accept()
                 return
         self._clear_press()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if self._gesture_cancelled:
+            if not event.buttons():
+                self._sync_pointer_cursor(event.position().toPoint())
+            event.accept()
+            return
         if self._drag is not None:
             if self._drag.phase == "dragging":
                 self._drag.pointer = QPointF(event.position())
@@ -326,7 +333,7 @@ class LibraryList(QListWidget):
         self._sync_pointer_cursor(event.position().toPoint())
         if (
             self._press_position is not None
-            and self._press_item is not None
+            and bool(self._press_library_id)
             and event.buttons() & Qt.MouseButton.LeftButton
             and (event.position() - self._press_position).manhattanLength()
             >= QApplication.startDragDistance()
@@ -337,6 +344,9 @@ class LibraryList(QListWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._gesture_cancelled:
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._drag is not None:
             if (
                 self.viewport().rect().contains(event.position().toPoint())
@@ -348,9 +358,9 @@ class LibraryList(QListWidget):
             self._clear_press()
             event.accept()
             return
-        if event.button() == Qt.MouseButton.LeftButton and self._press_item is not None:
+        if event.button() == Qt.MouseButton.LeftButton and bool(self._press_library_id):
             item = self.itemAt(event.position().toPoint())
-            if item is self._press_item:
+            if item is not None and item.data(LIBRARY_ROLE).library_id == self._press_library_id:
                 self.setCurrentItem(item)
             self._clear_press()
             event.accept()
@@ -358,16 +368,29 @@ class LibraryList(QListWidget):
         self._clear_press()
         super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event) -> None:
+        if self._gesture_cancelled:
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def _invalidate_gesture(self) -> None:
+        if self._press_position is not None or self._drag is not None:
+            self._gesture_cancelled = True
+        self._clear_press()
+        self._cancel_drag(immediate=True)
+
     def _clear_press(self) -> None:
         self._press_position = None
-        self._press_item = None
+        self._press_library_id = ""
 
     def _begin_drag(self, pointer: QPointF) -> bool:
-        if not self.isEnabled() or self._press_item is None or self.count() < 2:
+        item = self._item_for_id(self._press_library_id) if self._press_library_id else None
+        if not self.isEnabled() or item is None or self.count() < 2:
             return False
-        record: LibraryRecord = self._press_item.data(LIBRARY_ROLE)
-        original_row = self.row(self._press_item)
-        row_rect = self.visualItemRect(self._press_item)
+        record: LibraryRecord = item.data(LIBRARY_ROLE)
+        original_row = self.row(item)
+        row_rect = self.visualItemRect(item)
         row_height = self._row_height()
         press_position = self._press_position
         if press_position is None:
@@ -385,10 +408,10 @@ class LibraryList(QListWidget):
         }
         snapshot = self._delegate.render_row(
             record,
-            bool(self._press_item.data(AVAILABLE_ROLE)),
+            bool(item.data(AVAILABLE_ROLE)),
             self.viewport().width(),
             row_height,
-            selected=self.currentItem() is self._press_item,
+            selected=self.currentItem() is item,
         )
         now = monotonic()
         self._drag = _LibraryDrag(
@@ -635,8 +658,8 @@ class LibraryList(QListWidget):
         event.accept()
 
     def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_Escape and self._drag is not None:
-            self._cancel_drag()
+        if event.key() == Qt.Key.Key_Escape and (self._drag is not None or self._press_position is not None):
+            self._invalidate_gesture()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -648,16 +671,15 @@ class LibraryList(QListWidget):
             self._sync_pointer_cursor(None)
         elif (
             event.type() == QEvent.Type.UngrabMouse
-            and self._drag is not None
             and not self._releasing_mouse
         ):
-            self._cancel_drag()
+            self._invalidate_gesture()
         return super().viewportEvent(event)
 
     def changeEvent(self, event) -> None:
         if event.type() == QEvent.Type.EnabledChange:
             if not self.isEnabled():
-                self._cancel_drag(immediate=True)
+                self._invalidate_gesture()
             self._sync_pointer_cursor(None)
         super().changeEvent(event)
 
@@ -672,5 +694,5 @@ class LibraryList(QListWidget):
 
     def eventFilter(self, watched, event) -> bool:
         if watched is self._filtered_window and event.type() == QEvent.Type.WindowDeactivate:
-            self._cancel_drag()
+            self._invalidate_gesture()
         return super().eventFilter(watched, event)

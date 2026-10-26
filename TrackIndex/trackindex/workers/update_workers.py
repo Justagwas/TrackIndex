@@ -78,3 +78,28 @@ class UpdateInstallWorker(QObject):
 
     def stop(self) -> None:
         self._stop_event.set()
+
+
+class UpdateHandoffWorker(QObject):
+    completed = Signal()
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, prepared, restart: bool) -> None:
+        super().__init__()
+        self.prepared, self.restart = prepared, restart
+
+    @Slot()
+    def run(self) -> None:
+        assert_qt_thread_affinity(self)
+        try:
+            self_updater.launch_prepared_update(self.prepared, restart_after_update=self.restart)
+            self.completed.emit()
+        except Exception as exc:
+            self_updater.discard_prepared_update(self.prepared)
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+    def stop(self) -> None:
+        pass

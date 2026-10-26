@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import sys
 import uuid
 from collections import deque
@@ -12,6 +13,7 @@ from PySide6.QtCore import QObject, QProcess, QThread, QThreadPool, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QInputDialog, QMessageBox
 
+from trackindex.ui.update_dialog import get_update_dialog, ask_update_install_preference, ask_update_handoff, show_update_failure, show_update_notice
 from trackindex.controller.coordination_services import (
     LibraryCoordinationService,
     LibrarySnapshot,
@@ -63,9 +65,6 @@ from trackindex.core.transaction import (
 from trackindex.ui.dialogs import (
     DeleteTracksDialog,
     LibraryImportDialog,
-    UpdateProgressDialog,
-    ask_update_handoff,
-    ask_update_install_preference,
     styled_message,
 )
 from trackindex.ui.main_window import MainWindow
@@ -85,7 +84,7 @@ from trackindex.workers.library_workers import (
     TransactionTask,
     TransactionWorkerResult,
 )
-from trackindex.workers.update_workers import RuntimeCleanupTask, UpdateCheckWorker, UpdateInstallWorker
+from trackindex.workers.update_workers import RuntimeCleanupTask, UpdateCheckWorker, UpdateInstallWorker, UpdateHandoffWorker
 
 _LOG = diagnostics_logger("controller")
 
@@ -172,9 +171,10 @@ class AppController(QObject):
         self._discovery_worker: DiscoveryWorker | None = None
         self._warned_other_playlists: set[str] = set()
         self._update_thread: QThread | None = None
-        self._update_worker: UpdateCheckWorker | UpdateInstallWorker | None = None
+        self._update_worker: UpdateCheckWorker | UpdateInstallWorker | UpdateHandoffWorker | None = None
         self._updates = UpdateCoordinationService()
-        self._progress_dialog: UpdateProgressDialog | None = None
+        self._progress_dialog: QDialog | None = None
+        self.window._update_install_gate = lambda: "Let the current library operation finish before installing the update." if self._operation_busy() else ""
         self._setup_active = False
         self._setup_reconfiguring = False
         self._setup_mode = StorageMode.BOTH
@@ -324,6 +324,16 @@ class AppController(QObject):
     def set_playback_coordinator(self, coordinator: _PlaybackCoordinator) -> None:
         self._playback_coordinator = coordinator
 
+    def create_playback_artwork_task(
+        self, generation: int, track_id: str, path: Path,
+    ) -> MetadataTask:
+        return MetadataTask(
+            generation, track_id, path, 0, 0, None,
+            artwork_store=self.artwork_store,
+            filesystem_access=self._filesystem_gate.read,
+            discover_folder_artwork=True,
+        )
+
     def _start_snapshot_prefetch(self) -> None:
         if self._shutdown_started:
             return
@@ -472,12 +482,18 @@ class AppController(QObject):
 
     def open_folder(self) -> None:
         start = self.current_library.folder if self.current_library else Path(self.config.music_root)
-        selected = QFileDialog.getExistingDirectory(self.window, "Open music folder", str(start))
+        try:
+            selected = QFileDialog.getExistingDirectory(self.window, "Open music folder", str(start))
+        finally:
+            self.window.restore_cursor_state_after_modal()
         if selected:
             self._add_library(Path(selected))
 
     def create_playlist(self) -> None:
-        name, accepted = QInputDialog.getText(self.window, "Create playlist", "Playlist name:")
+        try:
+            name, accepted = QInputDialog.getText(self.window, "Create playlist", "Playlist name:")
+        finally:
+            self.window.restore_cursor_state_after_modal()
         if not accepted:
             return
         try:
@@ -1914,7 +1930,10 @@ class AppController(QObject):
         self._refresh_libraries(replacement.library_id)
 
     def change_music_root(self) -> None:
-        selected = QFileDialog.getExistingDirectory(self.window, "Choose music folder", self.config.music_root)
+        try:
+            selected = QFileDialog.getExistingDirectory(self.window, "Choose music folder", self.config.music_root)
+        finally:
+            self.window.restore_cursor_state_after_modal()
         if not selected:
             return
         self.config.music_root = str(Path(selected).resolve())
@@ -2252,7 +2271,7 @@ class AppController(QObject):
             return
         if not check.update_available:
             if self._updates.manual:
-                styled_message(self.window, QMessageBox.Icon.Information, "No update available", "You are already on the latest version").exec()
+                show_update_notice(self.window, "You are up to date", "You are using the latest version of TrackIndex.")
             return
         self._updates.record_check(check)
         notes = [f"- {line}" for line in check.notes[:8] if str(line).strip()]
@@ -2260,10 +2279,7 @@ class AppController(QObject):
         can_install = bool(check.install_supported and getattr(sys, "frozen", False))
         if check.requires_manual_update:
             can_install = False
-            details += (
-                "\n\nYour current version is below the minimum supported "
-                f"auto-update baseline ({check.minimum_supported_version})."
-            )
+            details += "\n\nThis version needs a manual update. Download and run the latest installer."
         proceed, auto_install = ask_update_install_preference(
             self.window,
             latest_version=check.latest_version,
@@ -2282,7 +2298,7 @@ class AppController(QObject):
         if self._shutdown_started:
             return
         if self._updates.manual:
-            styled_message(self.window, QMessageBox.Icon.Warning, "Update check failed", message).exec()
+            self._show_update_install_failure("Could not check for updates.\n" + message)
 
     def _start_update_install(self, check) -> None:
         if self._shutdown_started:
@@ -2290,8 +2306,8 @@ class AppController(QObject):
         if self._update_thread is not None:
             QTimer.singleShot(100, lambda: self._start_update_install(check))
             return
-        dialog = UpdateProgressDialog(self.window)
-        dialog.setStyleSheet(self.window.styleSheet())
+        dialog = get_update_dialog(self.window)
+        dialog.set_progress(0, "Preparing update...")
         thread = QThread(self)
         worker = UpdateInstallWorker(check)
         worker.moveToThread(thread)
@@ -2311,14 +2327,13 @@ class AppController(QObject):
 
     def _update_install_completed(self, prepared) -> None:
         assert_qt_thread_affinity(self)
-        if self._shutdown_started:
+        if self._shutdown_started or (self._progress_dialog is not None and self._progress_dialog.choice == "cancel"):
             self_updater.discard_prepared_update(prepared)
             return
         self._updates.stage(prepared)
-        self._close_update_progress()
 
     def _show_update_handoff(self, prepared: self_updater.PreparedUpdate) -> None:
-        if self._shutdown_started:
+        if self._shutdown_started or (self._progress_dialog is not None and self._progress_dialog.choice == "cancel"):
             self_updater.discard_prepared_update(prepared)
             return
         proceed, restart_after = ask_update_handoff(
@@ -2332,21 +2347,24 @@ class AppController(QObject):
             return
         if not proceed:
             self_updater.discard_prepared_update(prepared)
-            styled_message(
-                self.window,
-                QMessageBox.Icon.Information,
-                "Update canceled",
-                "Update was aborted. No installer was launched.",
-            ).exec()
+            self._close_update_progress()
             return
         coordinator = getattr(self.app, "shutdown_coordinator", None)
         if coordinator is None:
             self_updater.discard_prepared_update(prepared)
             self.window.show_toast("TrackIndex could not close safely to start the update.", None)
             return
-        coordinator.request(lambda: self_updater.launch_prepared_update(prepared, restart_after_update=restart_after),
-                            lambda: self_updater.discard_prepared_update(prepared),
-                            handoff_failed=self._show_update_install_failure)
+        thread = QThread(self)
+        worker = UpdateHandoffWorker(prepared, restart_after)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._close_after_update_handoff)
+        worker.failed.connect(self._show_update_install_failure)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._clear_update_thread)
+        self._update_thread, self._update_worker = thread, worker
+        thread.start()
 
     @Slot(str)
     def _update_install_failed(self, message: str) -> None:
@@ -2357,34 +2375,43 @@ class AppController(QObject):
         self._show_update_install_failure(message)
 
     def _show_update_install_failure(self, message: str) -> None:
-        styled_message(
-            self.window,
-            QMessageBox.Icon.Critical,
-            "Update failed",
-            message,
-        ).exec()
-        self._offer_update_page_fallback()
+        choice = show_update_failure(self.window, message, retry=not self._shutdown_started)
+        if choice == "manual":
+            self._open_update_page(self._updates.fallback_url())
+        elif choice == "retry":
+            QTimer.singleShot(0, self._retry_failed_update)
 
     @Slot()
     def _update_install_canceled(self) -> None:
         assert_qt_thread_affinity(self)
+        self._close_update_progress()
+
+    @Slot()
+    def _close_after_update_handoff(self) -> None:
+        if self._update_thread is not None:
+            QTimer.singleShot(20, self._close_after_update_handoff)
+            return
+        coordinator = getattr(self.app, "shutdown_coordinator", None)
+        if coordinator is not None:
+            coordinator.request(handoff=self._confirm_update_shutdown, handoff_failed=self._show_update_install_failure)
+
+    def _confirm_update_shutdown(self) -> None:
+        if not self._shutdown_settled:
+            raise RuntimeError("The library could not be saved. Installation was not started.")
+
+    def _retry_failed_update(self) -> None:
         if self._shutdown_started:
             return
-        self._close_update_progress()
-        styled_message(
-            self.window,
-            QMessageBox.Icon.Information,
-            "Update canceled",
-            "Update was canceled before installation started.",
-        ).exec()
+        if self._update_thread is not None:
+            QTimer.singleShot(100, self._retry_failed_update)
+        else:
+            self.check_for_updates(manual=True)
 
     def _close_update_progress(self) -> None:
         dialog = self._progress_dialog
-        if dialog is None:
-            return
         self._progress_dialog = None
-        dialog.accept()
-        dialog.deleteLater()
+        if dialog is not None:
+            dialog.hide()
 
     def _open_update_page(self, url: str = "") -> None:
         target = str(url or DOWNLOAD_PAGE_URL).strip() or DOWNLOAD_PAGE_URL

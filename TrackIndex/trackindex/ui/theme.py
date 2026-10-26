@@ -38,6 +38,8 @@ def build_stylesheet(theme: ThemePalette, ui_scale: float = 1.0) -> str:
     def pt(value: float) -> float:
         return max(7.0, round(value * scale, 1))
 
+    combo_content_height = max(1, round(30 * scale) - 2 * px(2) - 2)
+
     return f"""
 QMainWindow, QDialog {{ background: {theme.app_bg}; }}
 QWidget#trackindexRoot, QWidget#mainColumn {{ background: {theme.app_bg}; }}
@@ -109,7 +111,11 @@ QPushButton#setupModeCard:focus {{ border-color: {theme.accent}; }}
 QLineEdit, QComboBox, QPlainTextEdit, QTextBrowser, QListWidget, QTableView {{ background: {theme.app_bg}; color: {theme.text_primary}; border: 1px solid {theme.border}; border-radius: {px(6)}px; padding: {px(4)}px {px(7)}px; selection-background-color: {theme.accent}; font: 600 {pt(9.0):.1f}pt "Segoe UI"; }}
 QLineEdit#settingsReadOnlyInput {{ background: {theme.app_bg}; color: {theme.text_primary}; border: 1px solid {theme.border}; border-radius: {px(6)}px; padding: {px(3)}px {px(7)}px; font: 600 {pt(9.5):.1f}pt "Segoe UI"; }}
 QLineEdit#settingsReadOnlyInput:disabled {{ background: {theme.disabled_bg}; color: {theme.disabled_fg}; border-color: {theme.border}; }}
-QComboBox::drop-down {{ border: none; width: {px(24)}px; }}
+QComboBox {{ padding: {px(2)}px {px(24)}px {px(2)}px {px(7)}px; min-height: {combo_content_height}px; font: 600 {pt(9.1):.1f}pt "Segoe UI"; }}
+QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right;
+    border: none; border-left: 1px solid {theme.border}; width: {px(24)}px;
+    background: transparent; }}
+QComboBox::down-arrow {{ image: none; width: 0px; height: 0px; border: none; }}
 QComboBox QAbstractItemView {{ background: {theme.panel_bg}; color: {theme.text_primary}; border: 1px solid {theme.border}; selection-background-color: {theme.accent}; }}
 QListWidget {{ outline: none; padding: {px(5)}px; }}
 QTableView {{ outline: none; gridline-color: {theme.border}; selection-background-color: transparent; }}

@@ -29,6 +29,7 @@ from .config import (
 )
 from .filesystem import is_link_like
 from .paths import app_dir, product_data_dir
+from ..update_handoff import arm_update
 
 _ALLOWED_HOSTS = {
     "justagwas.com",
@@ -40,7 +41,7 @@ _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 _UPDATE_STAGING_RE = re.compile(r"^trackindex-update-[0-9a-f]{32}$")
-_UPDATE_FILES = ("TrackIndexSetup.exe", "TrackIndexSetup.exe.tmp")
+_UPDATE_FILES = ("TrackIndexSetup.exe", "TrackIndexSetup.exe.tmp", "UpdateHelper.exe")
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +79,7 @@ class PreparedUpdate:
     setup_sha256: str = ""
     setup_size: int = 0
     requires_elevation: bool = False
+    notes: tuple[str, ...] = ()
 
 
 def parse_semver(value: str) -> tuple[int, int, int] | None:
@@ -324,7 +326,7 @@ def prepare_update(
                 handle.write(chunk)
                 digest.update(chunk)
                 if progress_callback:
-                    progress_callback(min(94.0, downloaded / check.setup_size * 94.0), f"Downloading update... {downloaded / check.setup_size:.0%}")
+                    progress_callback(min(100.0, downloaded / check.setup_size * 100.0), "Downloading update...")
             handle.flush()
             os.fsync(handle.fileno())
         if downloaded != check.setup_size:
@@ -343,6 +345,7 @@ def prepare_update(
             check.setup_sha256,
             check.setup_size,
             _installer_mode() == "/ALLUSERS",
+            check.notes,
         )
     except Exception:
         _remove_staged_update(root, staging_root)
@@ -385,37 +388,11 @@ def launch_prepared_update(prepared: PreparedUpdate, *, restart_after_update: bo
         raise RuntimeError(f"Prepared update is unavailable: {exc}") from exc
     if size != prepared.setup_size or digest.casefold() != prepared.setup_sha256.casefold():
         raise RuntimeError("Prepared update changed after verification.")
-    mode = _installer_mode()
-    args = [
-        "/VERYSILENT",
-        "/SP-",
-        "/SUPPRESSMSGBOXES",
-        "/NORESTART",
-        "/CLOSEAPPLICATIONS",
-        "/FORCECLOSEAPPLICATIONS",
-        mode,
-        f"/DIR={app_dir()}",
-    ]
-    if not restart_after_update:
-        args.append("/SKIPLAUNCH")
-    if mode == "/ALLUSERS":
-        import ctypes
-
-        result = int(
-            ctypes.windll.shell32.ShellExecuteW(
-                None,
-                "runas",
-                str(setup_path),
-                subprocess.list2cmdline(args),
-                str(update_root),
-                1,
-            )
-        )
-        if result <= 32:
-            raise RuntimeError("Administrator permission was denied or the update installer could not be started.")
-        return
-    flags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) | int(getattr(subprocess, "DETACHED_PROCESS", 0))
-    subprocess.Popen([str(setup_path), *args], close_fds=True, creationflags=flags)
+    arm_update(setup_path=setup_path, sha256=prepared.setup_sha256,
+               size=prepared.setup_size, version=prepared.latest_version,
+               current_version=APP_VERSION, notes=prepared.notes, install_dir=app_dir(),
+               mode=_installer_mode(), restart=restart_after_update,
+               staging_root=update_root)
 
 
 def discard_prepared_update(prepared: PreparedUpdate) -> None:

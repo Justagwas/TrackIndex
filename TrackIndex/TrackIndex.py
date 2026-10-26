@@ -76,20 +76,9 @@ def main() -> int:
     from trackindex.core.config import APP_NAME, APP_VERSION, MUTEX_NAME
     _enable_high_dpi_rendering()
 
-    from trackindex.core.metadata_service import prepare_all_metadata_backends
-
-    prepare_all_metadata_backends()
-
     from PySide6.QtCore import QCoreApplication, Qt
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtWidgets import QApplication, QMessageBox
-
-    from trackindex.controller.app_controller import AppController
-    from trackindex.controller.playback_controller import PlaybackController
-    from trackindex.core.config_service import load_config
-    from trackindex.core.diagnostics import configure_diagnostics, register_private_path
-    from trackindex.ui.main_window import MainWindow
-    from trackindex.ui.theme import get_theme
 
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -104,38 +93,71 @@ def main() -> int:
         QMessageBox.information(None, APP_NAME, "TrackIndex is already running.")
         return 0
 
-    config = load_config()
-    configure_diagnostics()
-    register_private_path(config.music_root)
-    for library in config.libraries:
-        register_private_path(library.folder)
-    project_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    icon_path = project_root / "icon.ico"
-    window = MainWindow(
-        get_theme(config.theme_mode),
-        theme_mode=config.theme_mode,
-        ui_scale_percent=config.ui_scale_percent,
-        auto_updates=config.auto_check_updates,
-        confirm_track_deletion=config.confirm_track_deletion,
-        window_pinned=config.window_pinned,
-        music_root=config.music_root,
-        icon_path=icon_path,
-    )
+    controller = None
+    splash = None
     try:
-        controller = AppController(app, window, config)
-        with suppress(RuntimeError, TypeError):
-            app.aboutToQuit.disconnect(controller.shutdown)
-        playback = PlaybackController(app, window, controller, config)
-        from trackindex.controller.shutdown_coordinator import ShutdownCoordinator
-        coordinator = ShutdownCoordinator(app, window, controller, playback)
-    except BaseException:
-        from trackindex.core.process_exit import emergency_exit
-        emergency_exit()
-    window.show()
-    try:
+        from trackindex.ui.loading_splash import create_loading_splash
+        splash = create_loading_splash(APP_NAME)
+        splash.show()
+        app.processEvents()
+        splash.set_status("Preparing audio metadata readers...")
+        from trackindex.core.metadata_service import prepare_all_metadata_backends
+        prepare_all_metadata_backends()
+        splash.set_status("Loading application components...")
+        from trackindex.controller.app_controller import AppController
+        from trackindex.controller.playback_controller import PlaybackController
+        from trackindex.core.config_service import load_config
+        from trackindex.core.diagnostics import configure_diagnostics, register_private_path
+        from trackindex.ui.main_window import MainWindow
+        from trackindex.ui.theme import get_theme
+
+        splash.set_status("Loading saved preferences...")
+        config = load_config()
+        configure_diagnostics()
+        register_private_path(config.music_root)
+        for library in config.libraries:
+            register_private_path(library.folder)
+        project_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        icon_path = project_root / "icon.ico"
+        splash.set_status("Building the main window...")
+        window = MainWindow(
+            get_theme(config.theme_mode),
+            theme_mode=config.theme_mode,
+            ui_scale_percent=config.ui_scale_percent,
+            auto_updates=config.auto_check_updates,
+            confirm_track_deletion=config.confirm_track_deletion,
+            window_pinned=config.window_pinned,
+            music_root=config.music_root,
+            icon_path=icon_path,
+        )
+        try:
+            splash.set_status("Preparing the library interface...")
+            controller = AppController(app, window, config)
+            with suppress(RuntimeError, TypeError):
+                app.aboutToQuit.disconnect(controller.shutdown)
+            splash.set_status("Initializing playback...")
+            playback = PlaybackController(app, window, controller, config)
+            from trackindex.controller.shutdown_coordinator import ShutdownCoordinator
+            coordinator = ShutdownCoordinator(app, window, controller, playback)
+        except BaseException:
+            splash.close()
+            from trackindex.core.process_exit import emergency_exit
+            emergency_exit()
+        splash.close()
+        window.show()
+        from PySide6.QtCore import QTimer
+        from trackindex.ui.update_dialog import show_update_completion
+        QTimer.singleShot(0, window, lambda: show_update_completion(window))
         return app.exec()
     finally:
+        if splash is not None:
+            splash.close()
         guard.release()
+        from trackindex.update_handoff import abort_pending_update, commit_pending_update
+        if controller is not None and controller._shutdown_settled:
+            commit_pending_update()
+        else:
+            abort_pending_update()
 
 
 if __name__ == "__main__":

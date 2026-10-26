@@ -177,17 +177,21 @@ class PlaybackQueue:
 
     def advance(self, *, natural: bool = False) -> QueueEntry | None:
         track_id = self.peek_next_id(natural=natural)
-        if not track_id:
+        return self.adopt(track_id) if track_id else None
+
+    def adopt(self, track_id: str) -> QueueEntry | None:
+        entry = self.entry(track_id)
+        if entry is None:
             return None
         if track_id != self.current_id:
-            if self.current_id not in self.unavailable:
+            if self.current_id and self.current_id not in self.unavailable:
                 self.history.append(self.current_id)
                 self.history = self.history[-len(self.entries) :]
             self._future = [item for item in self._future if item != track_id]
             self.current_id = track_id
             if self.shuffle and self.repeat is RepeatMode.ALL and not self._future:
                 self._rebuild_shuffle_cycle()
-        return self.current
+        return entry
 
     def previous(self) -> QueueEntry | None:
         if self.shuffle:

@@ -3,7 +3,6 @@ from __future__ import annotations
 from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -23,6 +22,7 @@ from trackindex.core.models import (
     StorageMode,
 )
 from trackindex.ui.interaction import apply_media_crate_scrollbar
+from .widgets.combo_box import ChevronComboBox
 
 
 class StorageModeCard(QPushButton):
@@ -216,7 +216,7 @@ class LibrarySetupPanel(QWidget):
         self.playlist_label = QLabel("Playlist file", self.playlist_section)
         self.playlist_label.setObjectName("setupSectionLabel")
         playlist_layout.addWidget(self.playlist_label)
-        self.playlist_combo = QComboBox(self.playlist_section)
+        self.playlist_combo = ChevronComboBox(self.playlist_section)
         self.playlist_combo.currentIndexChanged.connect(self._playlist_changed)
         playlist_layout.addWidget(self.playlist_combo)
         layout.addWidget(self.playlist_section)

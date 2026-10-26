@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .atomic_io import atomic_write_json
+from .audio_settings import AudioSettings
 from .config import (
     CONFIG_SCHEMA_VERSION,
     SUPPORTED_PLAYLIST_EXTENSIONS,
@@ -39,6 +40,7 @@ class AppConfig:
     playback_muted: bool = False
     playback_shuffle: bool = False
     playback_repeat: str = "off"
+    audio: AudioSettings = field(default_factory=AudioSettings)
 
 
 def default_config() -> AppConfig:
@@ -173,6 +175,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         playback_muted=_coerce_bool(payload.get("playback_muted"), False),
         playback_shuffle=_coerce_bool(payload.get("playback_shuffle"), False),
         playback_repeat=_coerce_repeat(payload.get("playback_repeat")),
+        audio=AudioSettings.from_dict(payload.get("audio")),
     )
 
 
@@ -203,5 +206,6 @@ def save_config(config: AppConfig, path: Path | None = None) -> None:
         "playback_muted": bool(config.playback_muted),
         "playback_shuffle": bool(config.playback_shuffle),
         "playback_repeat": _coerce_repeat(config.playback_repeat),
+        "audio": config.audio.to_dict(),
     }
     atomic_write_json(target, payload)

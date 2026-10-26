@@ -9,10 +9,13 @@ from PySide6.QtCore import (
     QPoint,
     QPointF,
     QPropertyAnimation,
+    QRect,
     QSize,
+    QSignalBlocker,
     Qt,
     QTimer,
     QUrl,
+    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
@@ -63,6 +66,7 @@ from .setup_panel import LibrarySetupPanel
 from .theme import ThemePalette, build_stylesheet
 from .track_list import TrackTableView
 from .windows_titlebar import apply_windows_titlebar_theme
+from .widgets.combo_box import ChevronComboBox
 
 
 class MainWindow(QMainWindow):
@@ -100,6 +104,17 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.theme, self.theme_mode, self.ui_scale_percent = theme, theme_mode, ui_scale_percent
         self._settings_visible = False
+        self._requested_surface = "none"
+        self._audio_panel = None
+        self._audio_clip = None
+        self._audio_progress = 0.0
+        self._audio_bounds = QRect()
+        self._audio_geometry_busy = False
+        self._audio_restore_focus = False
+        self._audio_focus_on_open = False
+        self._audio_geometry_timer = QTimer(self)
+        self._audio_geometry_timer.setSingleShot(True)
+        self._audio_geometry_timer.timeout.connect(self._sync_audio_geometry)
         self._window_pinned = False
         self._base_settings_width = 325
         self._base_minimum_width = 1000
@@ -108,6 +123,7 @@ class MainWindow(QMainWindow):
         self._has_filename_prefixes = False
         self._audit_blocked = False
         self._closing = False
+        self._restore_track_focus_after_save = False
         self.setWindowTitle(APP_NAME)
         self.resize(1000, 720)
         self.setMinimumSize(self._minimum_window_width(), 600)
@@ -255,6 +271,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.track_stack, 1)
         self.player_panel = PlayerPanel(self.theme, self.ui_scale_percent / 100, main)
         layout.addWidget(self.player_panel)
+        self.player_panel.resizedDuringAnimation.connect(self._sync_audio_geometry)
+        self.player_panel.audioInfoRequested.connect(self._audio_info_requested)
+        self._audio_animation = QVariantAnimation(self)
+        self._audio_animation.valueChanged.connect(self._set_audio_progress)
+        self._audio_animation.finished.connect(self._audio_animation_finished)
 
         self.toast = QFrame(main)
         self.toast.setObjectName("toast")
@@ -306,6 +327,7 @@ class MainWindow(QMainWindow):
         self.settings_animation.setDuration(160)
         self.settings_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.settings_animation.valueChanged.connect(self._sync_settings_drawer_width)
+        self.settings_animation.finished.connect(self._drive_surfaces)
         self.settings_panel.uiScaleChanged.connect(self.uiScaleChanged.emit)
         self.settings_panel.autoUpdatesChanged.connect(self.autoUpdatesChanged.emit)
         self.settings_panel.confirmTrackDeletionChanged.connect(
@@ -376,6 +398,7 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._sync_responsive_setup_layout()
+        self._sync_audio_geometry()
         if (
             hasattr(self, "toast")
             and self.toast.isVisible()
@@ -583,9 +606,19 @@ class MainWindow(QMainWindow):
     def set_saving(self, saving: bool, message: str = "") -> None:
         if self._closing:
             return
+        focus = QApplication.focusWidget()
+        if saving and focus is not None and (
+            focus is self.track_table or self.track_table.isAncestorOf(focus)
+        ):
+            self._restore_track_focus_after_save = True
+            focus.clearFocus()
         self.track_table.setEnabled(not saving and not self._audit_blocked)
         self.setup_panel.setEnabled(not saving)
         self.save_status.setText((message or "Saving...") if saving else message)
+        if not saving and self._restore_track_focus_after_save:
+            self._restore_track_focus_after_save = False
+            if self.track_table.isEnabled() and QApplication.focusWidget() is None:
+                self.track_table.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def set_closing_status(self, message: str = "Closing...") -> None:
         self._closing = True
@@ -656,13 +689,197 @@ class MainWindow(QMainWindow):
             self.redoRequested.emit()
 
     def toggle_settings(self) -> None:
-        self._settings_visible = not self._settings_visible
+        target = "none" if self._requested_surface == "settings" else "settings"
+        self._request_surface(target)
+
+    def ensure_audio_panel(self):
+        if self._audio_panel is None:
+            from .audio_panel import AudioPanel
+            self._audio_clip = QWidget(self.main_panel)
+            self._audio_clip.setObjectName("audioOverlayClip")
+            self._audio_clip.hide()
+            self._audio_panel = AudioPanel(self._audio_clip)
+            self._audio_panel.closeRequested.connect(self.hide_audio_panel)
+            self._audio_panel.set_appearance(self.theme, self.ui_scale_percent / 100)
+        return self._audio_panel
+
+    def show_audio_panel(self) -> None:
+        self.ensure_audio_panel()
+        self.player_panel._info_popup.hide()
+        if self._requested_surface != "audio":
+            self._audio_focus_on_open = True
+        self._request_surface("audio")
+
+    def hide_audio_panel(self, *, restore_focus=True) -> None:
+        if self._requested_surface == "audio":
+            self._audio_restore_focus = restore_focus
+            self._request_surface("none")
+
+    def audio_owns_widget(self, widget) -> bool:
+        return bool(self._audio_panel is not None and isinstance(widget, QWidget)
+                    and (widget is self._audio_panel or self._audio_panel.isAncestorOf(widget)))
+
+    def _request_surface(self, target: str) -> None:
+        if self._closing:
+            return
+        self._requested_surface = target
+        self._settings_visible = target == "settings"
         self.settings_toggle_button.setChecked(self._settings_visible)
         self.settings_toggle_button.setToolTip("Hide settings" if self._settings_visible else "Show settings")
+        self.player_panel.audio_button.setChecked(target == "audio")
+        self.player_panel.audio_button.setToolTip("Close audio settings" if target == "audio" else "Audio settings")
+        self.player_panel._refresh_icons()
+        if target != "audio":
+            self._audio_focus_on_open = False
+            if self._audio_panel is not None:
+                self._audio_panel.flush_pending_changes()
+                self._audio_panel.close_dropdowns()
+        if target == "settings":
+            self._audio_restore_focus = False
+        self._drive_surfaces()
+
+    def _drive_surfaces(self) -> None:
+        if self._closing:
+            return
+        if self._requested_surface == "audio":
+            if self.settings_container.width() > 0:
+                self._animate_settings(0)
+            else:
+                self.settings_animation.stop()
+                self.main_layout.activate()
+                self._sync_audio_geometry()
+                self._animate_audio(1.0)
+        elif self._audio_progress > 0:
+            self._animate_audio(0.0)
+        else:
+            self._audio_animation.stop()
+            if self._audio_clip is not None:
+                self._audio_clip.hide()
+            self._restore_audio_focus()
+            self._animate_settings(self._settings_target_width() if self._settings_visible else 0)
+
+    def _animate_settings(self, width: int) -> None:
+        if (self.settings_animation.state() == QAbstractAnimation.State.Running
+                and self.settings_animation.endValue() == width):
+            return
         self.settings_animation.stop()
+        if self.settings_container.width() == width:
+            return
         self.settings_animation.setStartValue(self.settings_container.width())
-        self.settings_animation.setEndValue(self._settings_target_width() if self._settings_visible else 0)
+        self.settings_animation.setEndValue(width)
         self.settings_animation.start()
+
+    def _animate_audio(self, target: float) -> None:
+        if (self._audio_animation.state() == QAbstractAnimation.State.Running
+                and self._audio_animation.endValue() == target):
+            return
+        self._audio_animation.stop()
+        if self._audio_panel is None:
+            return
+        if self._audio_progress == target:
+            self._settle_audio_state()
+            return
+        start = self._audio_progress
+        self._audio_panel.setEnabled(False)
+        self._audio_panel.show()
+        self._audio_clip.show()
+        self._audio_clip.raise_()
+        self.toast.raise_()
+        with QSignalBlocker(self._audio_animation):
+            self._audio_animation.setDuration(max(1, round((180 if target else 140) * abs(target - start))))
+            self._audio_animation.setEasingCurve(QEasingCurve.Type.OutCubic if target else QEasingCurve.Type.InCubic)
+            self._audio_animation.setStartValue(start)
+            self._audio_animation.setEndValue(target)
+            self._audio_animation.setCurrentTime(0)
+        self._audio_animation.start()
+
+    def _set_audio_progress(self, value) -> None:
+        self._audio_progress = float(value)
+        if self._audio_clip is not None:
+            bounds = self._audio_bounds
+            height = round(bounds.height() * self._audio_progress)
+            self._audio_clip.setGeometry(bounds.x(), bounds.bottom() + 1 - height, bounds.width(), height)
+
+    def _audio_animation_finished(self) -> None:
+        self._settle_audio_state()
+        self._drive_surfaces()
+
+    def _settle_audio_state(self) -> None:
+        if self._audio_panel is None:
+            return
+        opened = self._audio_progress == 1.0 and self._requested_surface == "audio"
+        self._audio_panel.setEnabled(opened)
+        if opened and self._audio_focus_on_open and self.isActiveWindow() and not self.isMinimized():
+            focus = (self._audio_panel.close_button if self._audio_panel.scroll.verticalScrollBar().value()
+                     else self._audio_panel.gapless)
+            focus.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._audio_focus_on_open = False
+        if self._audio_progress == 0:
+            self._audio_clip.hide()
+            self._restore_audio_focus()
+
+    def _restore_audio_focus(self) -> None:
+        if self._audio_restore_focus and self._requested_surface == "none" and self.isActiveWindow():
+            button = self.player_panel.audio_button if self.player_panel.isVisible() else self.settings_toggle_button
+            button.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._audio_restore_focus = False
+
+    def _sync_audio_geometry(self) -> None:
+        if self._audio_panel is None or self._audio_geometry_busy:
+            return
+        self._audio_geometry_busy = True
+        try:
+            self.centralWidget().layout().activate()
+            self.main_layout.activate()
+            area = self.main_panel.rect().marginsRemoved(self.main_layout.contentsMargins())
+            scale = self.ui_scale_percent / 100
+            gap = round(8 * scale)
+            bottom = self.player_panel.y() - gap if not self.player_panel.isHidden() else area.bottom() + 1
+            height = max(1, min(round(720 * scale), bottom - area.top()))
+            bounds = QRect(area.x(), bottom - height, area.width(), height)
+            if bounds.width() != self._audio_panel.width():
+                self._audio_panel.close_dropdowns()
+                self._audio_panel.resize(bounds.width(), height)
+            height = min(height, self._audio_panel.natural_height())
+            bounds.setTop(bottom - height)
+            if bounds != self._audio_bounds:
+                self._audio_panel.close_dropdowns()
+                self._audio_bounds = bounds
+                self._audio_panel.setGeometry(0, 0, bounds.width(), bounds.height())
+            self._set_audio_progress(self._audio_progress)
+        finally:
+            self._audio_geometry_busy = False
+
+    def _audio_info_requested(self) -> None:
+        self.hide_audio_panel(restore_focus=False)
+        self._audio_animation.stop()
+        self._set_audio_progress(0.0)
+        self._audio_animation_finished()
+
+    def finish_audio_interaction(self) -> None:
+        if self._audio_panel is not None:
+            self._audio_panel.flush_pending_changes()
+            self._audio_panel.close_dropdowns()
+        self._requested_surface = "none"
+        self._audio_geometry_timer.stop()
+        self._audio_animation.stop()
+        self.settings_animation.stop()
+        self._set_audio_progress(0.0)
+        if self._audio_clip is not None:
+            self._audio_clip.hide()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized() and hasattr(self, "settings_animation"):
+            self.settings_animation.stop()
+            self._audio_animation.stop()
+            self._audio_focus_on_open = False
+            self._audio_restore_focus = False
+            self._sync_settings_drawer_width(self._settings_target_width() if self._settings_visible else 0)
+            self._set_audio_progress(1.0 if self._requested_surface == "audio" else 0.0)
+            if self._audio_panel is not None:
+                self._audio_panel.setEnabled(self._requested_surface == "audio")
+                self._audio_clip.setVisible(self._requested_surface == "audio")
 
     def _settings_target_width(self) -> int:
         return round(self._base_settings_width * self.ui_scale_percent / 100)
@@ -678,6 +895,7 @@ class MainWindow(QMainWindow):
         self.settings_container.setMinimumWidth(width)
         self.settings_container.setMaximumWidth(width)
         self._sync_responsive_setup_layout()
+        self._sync_audio_geometry()
 
     def _sync_responsive_setup_layout(self) -> None:
 
@@ -728,6 +946,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(self._minimum_window_width(), 600)
         scale = ui_scale_percent / 100
         self.setStyleSheet(build_stylesheet(theme, scale) + build_footer_stylesheet(theme, scale, theme_mode))
+        for combo in self.findChildren(ChevronComboBox):
+            combo.set_theme(theme, scale)
         self._footer_layout.setContentsMargins(max(1, round(2 * scale)), 0, max(1, round(2 * scale)), 0)
         self._footer_layout.setSpacing(max(4, round(8 * scale)))
         icon_px = max(16, round(18 * scale))
@@ -757,8 +977,15 @@ class MainWindow(QMainWindow):
         apply_media_crate_scrollbar(self.track_table.verticalScrollBar())
         apply_media_crate_scrollbar(self.library_list.verticalScrollBar())
         apply_media_crate_scrollbar(self.settings_scroll.verticalScrollBar())
-        if self._settings_visible and self.settings_animation.state() != QAbstractAnimation.State.Running:
+        if (self._settings_visible and self._audio_progress == 0
+                and self.settings_animation.state() != QAbstractAnimation.State.Running):
             self._sync_settings_drawer_width(self._settings_target_width())
+        if self._audio_panel is not None:
+            self._audio_panel.close_dropdowns()
+            self._audio_panel.set_appearance(theme, scale)
+            self._sync_audio_geometry()
+        if self.settings_animation.state() == QAbstractAnimation.State.Running:
+            self._drive_surfaces()
         self.refresh_cursor_state()
         apply_windows_titlebar_theme(self, theme_mode == "dark")
 
@@ -915,6 +1142,26 @@ class MainWindow(QMainWindow):
         self.settings_panel.refresh_cursor_state()
 
     def eventFilter(self, watched, event):
+        if self._audio_panel is not None:
+            if watched in (self.main_panel, self.player_panel) and event.type() in {
+                QEvent.Type.Resize, QEvent.Type.Move, QEvent.Type.Show, QEvent.Type.Hide, QEvent.Type.LayoutRequest,
+            }:
+                if not self._audio_geometry_busy and not self._closing:
+                    self._audio_geometry_timer.start(0)
+            if (isinstance(watched, QWidget) and watched.window() is self
+                    and QApplication.activeModalWidget() is None):
+                if (self._requested_surface == "audio" and event.type() in {
+                        QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress}
+                        and event.key() == Qt.Key.Key_Escape and QApplication.activePopupWidget() is None):
+                    event.accept()
+                    if event.type() == QEvent.Type.KeyPress:
+                        self.hide_audio_panel()
+                    return True
+                if (self._requested_surface == "audio" and event.type() == QEvent.Type.MouseButtonPress
+                        and not self.audio_owns_widget(watched) and watched is not self._audio_clip
+                        and watched is not self.player_panel and not self.player_panel.isAncestorOf(watched)
+                        and QApplication.activePopupWidget() is None):
+                    self.hide_audio_panel(restore_focus=False)
         if (
             event.type() == QEvent.Type.MouseButtonPress
             and event.button() == Qt.MouseButton.LeftButton
@@ -954,7 +1201,7 @@ class MainWindow(QMainWindow):
         while QApplication.overrideCursor() is not None:
             QApplication.restoreOverrideCursor()
         self.refresh_cursor_state()
-        QTimer.singleShot(0, self.refresh_cursor_state)
+        QTimer.singleShot(0, self, self.refresh_cursor_state)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)

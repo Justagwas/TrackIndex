@@ -17,6 +17,14 @@ from PySide6.QtWidgets import (
 _SCROLLBAR_STYLES: WeakKeyDictionary[QScrollBar, QStyle] = WeakKeyDictionary()
 
 
+class RestoreCursorOnHide:
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        restore = getattr(self.parentWidget(), "restore_cursor_state_after_modal", None)
+        if callable(restore):
+            restore()
+
+
 def is_pointer_control(widget: object) -> bool:
     if isinstance(widget, QWidget) and widget.property("trackindexRowPointerOnly"):
         return False

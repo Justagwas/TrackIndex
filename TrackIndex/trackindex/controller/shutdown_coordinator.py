@@ -105,6 +105,9 @@ class ShutdownCoordinator(QObject):
                     discard()
                 except Exception:
                     _LOG.exception("Prepared update cleanup failed")
+            if error and handoff is not None:
+                from trackindex.update_handoff import abort_pending_update
+                abort_pending_update()
             if error and failed is not None:
                 try:
                     failed(error)

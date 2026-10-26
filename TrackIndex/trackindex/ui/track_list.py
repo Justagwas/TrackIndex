@@ -792,6 +792,8 @@ class TrackTableView(QTableView):
         self._hover_row = -1
         self._press_position: QPointF | None = None
         self._press_index = QModelIndex()
+        self._press_track_id = ""
+        self._gesture_cancelled = False
         self._deferred_single_selection = False
         self._drag: _DragSession | None = None
         self._order_transition: _OrderTransition | None = None
@@ -839,6 +841,12 @@ class TrackTableView(QTableView):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.setColumnWidth(0, 58)
         self.setColumnWidth(2, 80)
+        for signal in (self.track_model.modelAboutToBeReset,
+                       self.track_model.rowsAboutToBeInserted,
+                       self.track_model.rowsAboutToBeRemoved,
+                       self.track_model.rowsAboutToBeMoved,
+                       self.track_model.layoutAboutToBeChanged):
+            signal.connect(self._invalidate_gesture)
         self.track_model.orderChanged.connect(self.tracksDropped.emit)
         self.track_model.layoutAboutToBeChanged.connect(
             self._capture_layout_selection
@@ -965,7 +973,7 @@ class TrackTableView(QTableView):
                 self.viewport().update(QRect(0, rect.top(), self.viewport().width(), rect.height()))
 
     def set_appearance(self, theme: ThemePalette, scale: float) -> None:
-        self._cancel_drag(immediate=True)
+        self._invalidate_gesture()
         self._order_transition = None
         self._delegate.set_appearance(theme, scale)
         self.verticalHeader().setDefaultSectionSize(self._delegate.row_height())
@@ -977,7 +985,7 @@ class TrackTableView(QTableView):
         self.viewport().update()
 
     def set_tracks(self, tracks: list[TrackRecord]) -> None:
-        self._cancel_drag(immediate=True)
+        self._invalidate_gesture()
         self._order_transition = None
         self._hover_row = -1
         self._delegate.clear_card_cache()
@@ -985,7 +993,7 @@ class TrackTableView(QTableView):
         self._schedule_visible_rows()
 
     def reconcile_tracks(self, tracks: list[TrackRecord]) -> bool:
-        self._cancel_drag(immediate=True)
+        self._invalidate_gesture()
         self._order_transition = None
         self._hover_row = -1
         self._delegate.clear_card_cache()
@@ -1071,12 +1079,14 @@ class TrackTableView(QTableView):
                 self.viewport().update(QRect(0, rect.top(), self.viewport().width(), rect.height()))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        self._gesture_cancelled = False
         if event.button() != Qt.MouseButton.LeftButton or self._drag is not None:
             super().mousePressEvent(event)
             return
         index = self.indexAt(event.position().toPoint())
         self._press_position = QPointF(event.position())
         self._press_index = index
+        self._press_track_id = self.track_model.tracks[index.row()].track_id if index.isValid() else ""
         self._deferred_single_selection = False
         if not index.isValid():
             super().mousePressEvent(event)
@@ -1105,6 +1115,12 @@ class TrackTableView(QTableView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._gesture_cancelled:
+            if not event.buttons():
+                index = self.indexAt(event.position().toPoint())
+                self._set_hover_row(index.row() if index.isValid() else -1)
+            event.accept()
+            return
         if self._drag is not None:
             if self._drag.phase == "dragging":
                 self._drag.pointer = QPointF(event.position())
@@ -1114,7 +1130,7 @@ class TrackTableView(QTableView):
 
         if (
             self._press_position is not None
-            and self._press_index.isValid()
+            and self._valid_press()
             and event.buttons() & Qt.MouseButton.LeftButton
             and (event.position() - self._press_position).manhattanLength() >= QApplication.startDragDistance()
             and self._begin_drag(event.position())
@@ -1128,6 +1144,9 @@ class TrackTableView(QTableView):
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._gesture_cancelled:
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._drag is not None:
             inside = self.viewport().rect().contains(event.position().toPoint())
             if inside and self._drag.phase == "dragging":
@@ -1138,7 +1157,7 @@ class TrackTableView(QTableView):
             event.accept()
             return
 
-        if event.button() == Qt.MouseButton.LeftButton and self._deferred_single_selection and self._press_index.isValid():
+        if event.button() == Qt.MouseButton.LeftButton and self._deferred_single_selection and self._valid_press():
             track_id = self.track_model.tracks[self._press_index.row()].track_id
             artwork_hit = self._artwork_hit(self._press_index.row(), event.position().toPoint())
             self.selectionModel().select(
@@ -1155,9 +1174,23 @@ class TrackTableView(QTableView):
         self._clear_press_state()
         super().mouseReleaseEvent(event)
 
+    def _valid_press(self) -> bool:
+        index = self._press_index
+        return (index.isValid() and index.model() is self.track_model
+                and 0 <= index.row() < len(self.track_model.tracks)
+                and self.track_model.tracks[index.row()].track_id == self._press_track_id)
+
+    def _invalidate_gesture(self, *_args) -> None:
+        if self._press_position is not None or self._drag is not None:
+            self._gesture_cancelled = True
+        self._clear_press_state()
+        self._suppress_artwork_activation_once = False
+        self._cancel_drag(immediate=True)
+
     def _clear_press_state(self) -> None:
         self._press_position = None
         self._press_index = QModelIndex()
+        self._press_track_id = ""
         self._deferred_single_selection = False
 
     def _artwork_hit(self, row: int, point) -> bool:
@@ -1169,6 +1202,9 @@ class TrackTableView(QTableView):
         return self._delegate.artwork_rect(option).contains(point)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if self._gesture_cancelled:
+            event.accept()
+            return
         index = self.indexAt(event.position().toPoint())
         if event.button() == Qt.MouseButton.LeftButton and index.isValid() and self.isEnabled():
             if self._artwork_hit(index.row(), event.position().toPoint()):
@@ -1181,7 +1217,7 @@ class TrackTableView(QTableView):
 
     def _begin_drag(self, pointer: QPointF) -> bool:
         press_position = self._press_position
-        if not self.isEnabled() or not self._press_index.isValid() or press_position is None:
+        if not self.isEnabled() or not self._valid_press() or press_position is None:
             return False
         before = self.track_model.ordered_track_ids()
         selected_ids = self._selected_track_ids()
@@ -1606,8 +1642,8 @@ class TrackTableView(QTableView):
         painter.end()
 
     def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_Escape and self._drag is not None:
-            self._cancel_drag()
+        if event.key() == Qt.Key.Key_Escape and (self._drag is not None or self._press_position is not None):
+            self._invalidate_gesture()
             event.accept()
             return
         if event.key() == Qt.Key.Key_Delete and self._drag is None:
@@ -1635,8 +1671,8 @@ class TrackTableView(QTableView):
     def viewportEvent(self, event) -> bool:
         if event.type() == QEvent.Type.Leave:
             self._set_hover_row(-1)
-        elif event.type() == QEvent.Type.UngrabMouse and self._drag is not None and not self._releasing_mouse:
-            self._cancel_drag()
+        elif event.type() == QEvent.Type.UngrabMouse and not self._releasing_mouse:
+            self._invalidate_gesture()
         return super().viewportEvent(event)
 
     def resizeEvent(self, event) -> None:
@@ -1656,11 +1692,11 @@ class TrackTableView(QTableView):
 
     def eventFilter(self, watched, event) -> bool:
         if watched is self._filtered_window and event.type() == QEvent.Type.WindowDeactivate:
-            self._cancel_drag()
+            self._invalidate_gesture()
         return super().eventFilter(watched, event)
 
     def changeEvent(self, event) -> None:
         if event.type() == QEvent.Type.EnabledChange and not self.isEnabled():
-            self._cancel_drag()
+            self._invalidate_gesture()
             self._clear_external_drop()
         super().changeEvent(event)

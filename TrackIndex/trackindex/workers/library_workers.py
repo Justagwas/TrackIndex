@@ -250,6 +250,8 @@ class MetadataTask(QRunnable):
         fallback_artwork: bytes | PreparedArtwork | None,
         artwork_store: ArtworkStore | None = None,
         filesystem_access=None,
+        *,
+        discover_folder_artwork: bool = False,
     ) -> None:
         super().__init__()
         self.task_id = uuid.uuid4().hex
@@ -258,6 +260,7 @@ class MetadataTask(QRunnable):
         self.fallback_artwork = fallback_artwork
         self.artwork_store = artwork_store
         self.filesystem_access = filesystem_access
+        self.discover_folder_artwork = discover_folder_artwork
         self._stop_event = Event()
         self.signals = WorkerSignals()
 
@@ -272,6 +275,15 @@ class MetadataTask(QRunnable):
                 if self._stop_event.is_set():
                     return
                 value: TrackMetadata = read_track_metadata(self.path, None, backend)
+                if self.discover_folder_artwork and not value.artwork_bytes:
+                    if self._stop_event.is_set():
+                        return
+                    raw_artwork = folder_artwork(self.path.parent)
+                    self.fallback_artwork = (
+                        self.artwork_store.prepare(raw_artwork, self._stop_event.is_set)
+                        if raw_artwork and self.artwork_store is not None
+                        else raw_artwork
+                    )
                 if self.artwork_store is not None and value.artwork_bytes:
                     prepared = self.artwork_store.prepare(
                         value.artwork_bytes,
