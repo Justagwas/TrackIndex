@@ -38,6 +38,7 @@ from trackindex.ui.main_window import MainWindow
 from trackindex.workers.library_workers import MetadataTask, MetadataWorkerResult
 
 from .system_media import MediaContext, MediaPublication, SystemMediaBridge
+from .loudness_controller import LoudnessController
 
 _LOG = diagnostics_logger("playback")
 
@@ -135,6 +136,7 @@ class PlaybackWorker(QObject):
             "shutdown": self._execute_shutdown,
             "audio-settings": self._execute_audio_settings,
             "audio-devices": self._execute_audio_devices,
+            "loudness": self._execute_loudness,
         }
         handler = handlers.get(command)
         if handler is None:
@@ -226,6 +228,11 @@ class PlaybackWorker(QObject):
             self.backend.refresh_devices()
         return 0
 
+    def _execute_loudness(self, value: object) -> int:
+        if isinstance(value, dict) and hasattr(self.backend, "set_loudness"):
+            self.backend.set_loudness(value)
+        return 0
+
     def _execute_shutdown(self, _value: object) -> int:
         self._stopping = True
         try:
@@ -269,6 +276,8 @@ class PlaybackController(QObject):
         self._error_attempts = 0
         self._audio_panel = None
         self._audio_devices = []
+        self._audio_processing_status = {}
+        self._output_device_id = config.audio.device
         self._deferred_audio_baseline: AudioSettings | None = None
         self._artwork_pool = QThreadPool(self)
         self._artwork_pool.setMaxThreadCount(1)
@@ -318,6 +327,7 @@ class PlaybackController(QObject):
         self.worker.finished.connect(self._playback_thread.quit, Qt.ConnectionType.DirectConnection)
         self._playback_thread.finished.connect(self.worker.deleteLater)
         self._connect_ui()
+        self._loudness = LoudnessController(self)
         self._install_shortcuts()
         self.app.installEventFilter(self)
         self.app_controller.set_playback_coordinator(self)
@@ -386,6 +396,8 @@ class PlaybackController(QObject):
             self._audio_panel.set_settings(self.config.audio)
         self._audio_panel.set_devices(self._audio_devices)
         self._audio_panel.set_output(self.snapshot.output)
+        self._audio_panel.set_processing_status(self._audio_processing_status)
+        self._loudness.show_status()
         self.window.show_audio_panel()
         self.commandRequested.emit("audio-devices", None)
 
@@ -401,6 +413,8 @@ class PlaybackController(QObject):
             return
         previous = self.config.audio
         self.config.audio = settings
+        if (settings.normalization, settings.analysis_enabled) != (previous.normalization, previous.analysis_enabled):
+            self._loudness.schedule_refresh()
         self._config_timer.start()
         if self._mutation_library_id:
             if self._deferred_audio_baseline is None:
@@ -661,11 +675,12 @@ class PlaybackController(QObject):
         self.window.player_panel.set_presentation(PlayerPresentation.EXPANDED)
         self.window.track_table.set_playback_state(entry.track_id, not paused)
         generation = self._new_backend_generation()
-        self._active_backend_generation = generation
+        self._set_active_backend_generation(generation)
         position = _finite_float(resume_position)
         if position is not None:
             self._pending_resume = _PendingResume(generation, entry.library_id, entry.track_id, max(0.0, position))
         self.commandRequested.emit("load", (str(entry.path), paused, generation))
+        self._loudness.track_changed()
         self._request_current_artwork()
         self._refresh_lookahead()
 
@@ -712,6 +727,12 @@ class PlaybackController(QObject):
         self._next_backend_generation += 1
         return generation
 
+    def _set_active_backend_generation(self, generation: int) -> None:
+        self._active_backend_generation = generation
+        self._audio_processing_status = {}
+        if self._audio_panel is not None:
+            self._audio_panel.set_processing_status(self._audio_processing_status)
+
     @Slot()
     def toggle_play_pause(self) -> None:
         if self.snapshot.entry is None:
@@ -755,7 +776,7 @@ class PlaybackController(QObject):
         self._clear_pending_position()
         self._clear_resume_intent()
         self._backend_lookahead_id = ""
-        self._active_backend_generation = self._backend_lookahead_generation if generation is None else generation
+        self._set_active_backend_generation(self._backend_lookahead_generation if generation is None else generation)
         self._backend_lookahead_generation = 0
         self._awaiting_prefetched_load = True
         self._ignore_ended_until_loaded = True
@@ -770,6 +791,7 @@ class PlaybackController(QObject):
             loading=True,
             error="",
         )
+        self._loudness.track_changed()
         self.window.player_panel.set_snapshot(self.snapshot)
         self.window.track_table.set_playback_state(entry.track_id, not paused)
         if paused:
@@ -797,7 +819,7 @@ class PlaybackController(QObject):
         self._awaiting_prefetched_load = False
         self._backend_lookahead_id = ""
         self._backend_lookahead_generation = 0
-        self._active_backend_generation = self._new_backend_generation()
+        self._set_active_backend_generation(self._new_backend_generation())
         self.commandRequested.emit("stop", None)
         self.snapshot = replace(
             self.snapshot,
@@ -819,7 +841,7 @@ class PlaybackController(QObject):
         self._awaiting_prefetched_load = False
         self._backend_lookahead_id = ""
         self._backend_lookahead_generation = 0
-        self._active_backend_generation = self._new_backend_generation()
+        self._set_active_backend_generation(self._new_backend_generation())
         self.commandRequested.emit("stop", None)
         self.queue.clear()
         self.snapshot = replace(
@@ -835,6 +857,7 @@ class PlaybackController(QObject):
         self.window.player_panel.set_snapshot(self.snapshot)
         self.window.player_panel.set_presentation(PlayerPresentation.HIDDEN)
         self.window.track_table.set_playback_state("", False)
+        self._loudness.refresh()
 
     @Slot(float)
     def seek(self, seconds: float) -> None:
@@ -909,6 +932,7 @@ class PlaybackController(QObject):
             value = (None, 0)
         self._backend_lookahead_generation = generation
         self.commandRequested.emit("lookahead", value)
+        self._loudness.schedule_refresh()
 
     def reveal_current_track(self) -> None:
         entry = self.snapshot.entry
@@ -1001,12 +1025,15 @@ class PlaybackController(QObject):
             "output-recovery-failed",
             "ended",
             "error",
+            "normalization-status",
+            "processing-status",
         } and event.generation != self._active_backend_generation
 
     def _handle_worker_event(self, event: BackendEvent) -> bool:
         kind, value = event.kind, event.value
         if kind == "ready":
             self._available = True
+            self._loudness.schedule_refresh()
             self.commandRequested.emit("audio-settings", self.config.audio)
             self.commandRequested.emit("volume", self.snapshot.volume)
             self.commandRequested.emit("mute", self.snapshot.muted)
@@ -1015,9 +1042,29 @@ class PlaybackController(QObject):
             self._audio_devices = value if isinstance(value, list) else []
             if self._audio_panel is not None:
                 self._audio_panel.set_devices(self._audio_devices)
+            device_name = self._output_device_name(self._output_device_id)
+            if device_name != self.snapshot.output.device:
+                self.snapshot = replace(self.snapshot, output=replace(self.snapshot.output, device=device_name))
+                self._publish_playback_snapshot()
+            return True
+        if kind == "device-fallback":
+            if isinstance(value, str) and value != "auto" and self.config.audio.device == value:
+                self.config.audio = replace(self.config.audio, device="auto")
+                self._config_timer.start()
+                if self._audio_panel is not None:
+                    self._audio_panel.apply_device_fallback(value)
             return True
         if kind == "audio-notice":
             self.window.show_toast(str(value), None)
+            return True
+        if kind == "normalization-status":
+            self._loudness.backend_status(value)
+            return True
+        if kind == "processing-status":
+            if isinstance(value, dict):
+                self._audio_processing_status = value
+                if self._audio_panel is not None:
+                    self._audio_panel.set_processing_status(value)
             return True
         if kind == "unavailable":
             self._available = False
@@ -1179,12 +1226,21 @@ class PlaybackController(QObject):
         return True
 
     def _event_device(self, value: object) -> bool:
+        self._output_device_id = str(value or "auto")
         output = replace(
             self.snapshot.output,
-            device=str(value or "System default"),
+            device=self._output_device_name(self._output_device_id),
         )
         self.snapshot = replace(self.snapshot, output=output)
         return True
+
+    def _output_device_name(self, device_id: str) -> str:
+        if not device_id or device_id == "auto":
+            return "System default"
+        for item in self._audio_devices:
+            if isinstance(item, dict) and item.get("name") == device_id:
+                return str(item.get("description") or device_id)
+        return device_id
 
     def _event_ended(self, _value: object) -> bool:
         if self._ignore_ended_until_loaded or self._mutation_unloaded_current:
@@ -1253,9 +1309,8 @@ class PlaybackController(QObject):
         source = replace(
             source,
             sample_rate=_positive_int(value.get("samplerate")) or source.sample_rate,
-            channels=_positive_int(value.get("channels")) or source.channels,
-            channel_layout=str(value.get("channel-layout") or source.channel_layout),
-            bit_depth=_bit_depth(str(value.get("format") or "")) or source.bit_depth,
+            channels=_audio_channel_count(value) or source.channels,
+            channel_layout=_audio_channel_layout(value) or source.channel_layout,
         )
         self._replace_current_source(source)
 
@@ -1267,8 +1322,8 @@ class PlaybackController(QObject):
             output,
             sample_rate=_positive_int(value.get("samplerate")) or output.sample_rate,
             sample_format=str(value.get("format") or output.sample_format),
-            channels=_positive_int(value.get("channels")) or output.channels,
-            channel_layout=str(value.get("channel-layout") or output.channel_layout),
+            channels=_audio_channel_count(value) or output.channels,
+            channel_layout=_audio_channel_layout(value) or output.channel_layout,
         )
         self.snapshot = replace(self.snapshot, output=output)
 
@@ -1393,7 +1448,7 @@ class PlaybackController(QObject):
             self._intentional_stop = True
             self._backend_lookahead_id = ""
             self._backend_lookahead_generation = 0
-            self._active_backend_generation = self._new_backend_generation()
+            self._set_active_backend_generation(self._new_backend_generation())
             self.commandRequested.emit("stop", None)
         self.commandRequested.emit("prepare-mutation", (token, expected_generation))
         QTimer.singleShot(
@@ -1528,6 +1583,7 @@ class PlaybackController(QObject):
             return
         self.window.finish_audio_interaction()
         self._stopping = True
+        self._loudness.shutdown()
         self._deferred_audio_baseline = None
         self._cancel_artwork_request()
         self._reveal_request += 1
@@ -1542,7 +1598,8 @@ class PlaybackController(QObject):
         self.window.player_panel.set_presentation(PlayerPresentation.HIDDEN)
         self.commandRequested.emit("shutdown", None)
     def shutdown_drained(self) -> bool:
-        return self._playback_thread.wait(0) and self._artwork_pool.waitForDone(0)
+        return (self._playback_thread.wait(0) and self._artwork_pool.waitForDone(0)
+                and self._loudness.drained())
 
     def persist_shutdown_state(self) -> bool:
         try:
@@ -1553,12 +1610,22 @@ class PlaybackController(QObject):
         return True
 
 
-def _bit_depth(sample_format: str) -> int | None:
-    value = sample_format.casefold()
-    for depth in (64, 32, 24, 16, 8):
-        if str(depth) in value:
-            return depth
+def _audio_channel_count(params: dict) -> int | None:
+    for key in ("channel-count", "channels"):
+        value = params.get(key)
+        if not isinstance(value, bool):
+            count = _positive_int(value)
+            if count is not None:
+                return count
     return None
+
+
+def _audio_channel_layout(params: dict) -> str:
+    for key in ("hr-channels", "channels", "channel-layout"):
+        value = params.get(key)
+        if isinstance(value, str) and value.strip() and not value.strip().isdigit():
+            return value.strip()
+    return ""
 
 
 def _finite_float(value: object) -> float | None:

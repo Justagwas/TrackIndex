@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import math
+
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
@@ -28,9 +31,10 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
         self._sections = []
         self._scale = 1.0
         self._eq_columns = 10
+        self._processing_status = None
         self._commit_timer = QTimer(self)
         self._commit_timer.setSingleShot(True)
-        self._commit_timer.setInterval(100)
+        self._commit_timer.setInterval(33)
         self._commit_timer.timeout.connect(self._commit)
         root = QVBoxLayout(self)
         header = QHBoxLayout()
@@ -65,11 +69,11 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
         self.fade_layout = QVBoxLayout(self.fade_options)
         transitions.addWidget(self.fade_options)
         row = QHBoxLayout()
-        duration_title = QLabel("Duration", self)
+        duration_title = QLabel("Up to", self)
         duration_title.setObjectName("audioSettingLabel")
         self.duration = QSlider(Qt.Orientation.Horizontal, self)
         self.duration.setRange(2, 24)
-        self.duration.setAccessibleName("Crossfade duration")
+        self.duration.setAccessibleName("Maximum crossfade duration")
         duration_title.setBuddy(self.duration)
         self.duration_label = QLabel(self)
         self.duration_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -77,21 +81,27 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
         row.addWidget(self.duration, 1)
         row.addWidget(self.duration_label)
         self.fade_layout.addLayout(row)
+        self._hint("Short songs use a shorter fade. Changes to transitions take effect after an active fade finishes.", self.fade_layout)
         self.preserve = QCheckBox("Preserve album transitions", self)
         self.fade_layout.addWidget(self.preserve)
-        self._hint("Consecutive tracks from the same album play without overlap.", self.fade_layout)
+        self._hint("Consecutive tracks with matching album and artist tags play without overlap. Track numbers must identify their order.", self.fade_layout)
         loudness = self._section()
-        row = QHBoxLayout()
         label = self._heading("Loudness normalization")
+        loudness.addWidget(label)
         self.normalization = ChevronComboBox(self)
-        for title, value in (("Off", "off"), ("Track", "track"), ("Album", "album")):
+        for title, value in (("Track", "track"), ("Album", "album"), ("Off", "off")):
             self.normalization.addItem(title, value)
         label.setBuddy(self.normalization)
         self.normalization.setAccessibleName(label.text())
-        row.addWidget(label, 1)
-        row.addWidget(self.normalization)
-        loudness.addLayout(row)
+        loudness.addWidget(self.normalization)
         self.normalization_hint = self._hint("", loudness)
+        self.analysis = QCheckBox("Analyze missing loudness data automatically", self)
+        self.analysis.setToolTip("Automatically measure upcoming songs and keep the results locally.")
+        loudness.addWidget(self.analysis)
+        self.analysis_hint = self._hint("Check upcoming songs in the background. Results are saved locally without changing audio files or tags.", loudness)
+        self.normalization_status = self._hint("Choose a song to see its loudness status.", loudness)
+        self.normalization_status.setAccessibleName("Normalization status")
+        self.normalization_status.setTextFormat(Qt.TextFormat.PlainText)
         eq = self._section()
         row = QHBoxLayout()
         self.equalizer = QCheckBox("Equalizer", self)
@@ -113,6 +123,24 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
         preset_row.addWidget(preset_label)
         preset_row.addWidget(self.preset, 1)
         eq.addLayout(preset_row)
+        preamp_row = QHBoxLayout()
+        preamp_title = QLabel("Preamp", self)
+        preamp_title.setObjectName("audioSettingLabel")
+        self.preamp = QSlider(Qt.Orientation.Horizontal, self)
+        self.preamp.setRange(-24, 24)
+        self.preamp.setPageStep(2)
+        self.preamp.setAccessibleName("Equalizer preamp in decibels")
+        preamp_title.setBuddy(self.preamp)
+        self.preamp_value = QLabel(self)
+        self.preamp_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        preamp_row.addWidget(preamp_title)
+        preamp_row.addWidget(self.preamp, 1)
+        preamp_row.addWidget(self.preamp_value)
+        eq.addLayout(preamp_row)
+        self.auto_headroom = QCheckBox("Auto headroom", self)
+        self.auto_headroom.setToolTip("Reserve only the headroom needed for the current song, gains and playback volume.")
+        eq.addWidget(self.auto_headroom)
+        self.headroom_hint = self._hint("", eq)
         self.eq_box = QWidget(self)
         self.eq_grid = QGridLayout(self.eq_box)
         self.bands, self.values, self.captions = [], [], []
@@ -138,7 +166,15 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
             slider.valueChanged.connect(self._bands_changed)
             slider.sliderReleased.connect(self._commit)
         eq.addWidget(self.eq_box)
-        self._hint("Bass on the left, treble on the right. Values are in dB; headroom helps prevent distortion.", eq)
+        self._hint("Bass on the left, treble on the right. Boosting a band changes its level relative to the others; it can also make the song louder.", eq)
+        protection = self._section()
+        self.peak_protection = QCheckBox("Peak protection", self)
+        self.peak_protection.setObjectName("audioSectionTitle")
+        protection.addWidget(self.peak_protection)
+        self._hint("Reduce peaks that would overload the audio output. With no other audio effects active, disabling this bypasses TrackIndex's processing.", protection)
+        self.processing_status = self._hint("", protection)
+        self.processing_status.setAccessibleName("Audio processing status")
+        self.processing_status.setTextFormat(Qt.TextFormat.PlainText)
         output = self._section("Audio output")
         self.device = ChevronComboBox(self)
         self.device.setAccessibleName("Audio output device")
@@ -146,12 +182,15 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
         output.addWidget(self.device)
         self.output = self._hint("Output format appears during playback.", output)
         self.box.addStretch(1)
-        for check in (self.gapless, self.crossfade, self.preserve, self.equalizer):
-            check.toggled.connect(self._controls_changed)
-        self.normalization.currentIndexChanged.connect(self._controls_changed)
-        self.device.currentIndexChanged.connect(self._controls_changed)
+        for check in (self.gapless, self.crossfade, self.preserve, self.equalizer, self.auto_headroom,
+                      self.analysis, self.peak_protection):
+            check.toggled.connect(self._discrete_changed)
+        self.normalization.currentIndexChanged.connect(self._discrete_changed)
+        self.device.currentIndexChanged.connect(self._discrete_changed)
         self.duration.valueChanged.connect(self._controls_changed)
         self.duration.sliderReleased.connect(self._commit)
+        self.preamp.valueChanged.connect(self._controls_changed)
+        self.preamp.sliderReleased.connect(self._commit)
         self.preset.currentTextChanged.connect(self._preset_changed)
         self.reset.clicked.connect(lambda: self._preset_changed("Flat"))
         self.set_settings(self._settings)
@@ -192,11 +231,16 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
         self.crossfade.setChecked(settings.crossfade)
         self.preserve.setChecked(settings.preserve_albums)
         self.equalizer.setChecked(settings.eq_enabled)
+        self.preamp.setValue(round(settings.eq_preamp * 2))
+        self.auto_headroom.setChecked(settings.eq_auto_headroom)
+        self.analysis.setChecked(settings.analysis_enabled)
+        self.peak_protection.setChecked(settings.peak_protection)
         self.duration.setValue(round(settings.crossfade_seconds * 2))
         self.normalization.setCurrentIndex(self.normalization.findData(settings.normalization))
         for slider, gain in zip(self.bands, settings.eq_gains, strict=True):
             slider.setValue(round(gain * 2))
         self._updating = False
+        self._processing_status = None
         self.set_devices(self._devices)
         self._refresh_labels()
 
@@ -222,20 +266,43 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
         else:
             self.output.setText("Output format appears during playback.")
 
+    def set_normalization_status(self, text: str) -> None:
+        self.normalization_status.setText(text)
+
+    def set_processing_status(self, status: dict) -> None:
+        if isinstance(status, dict):
+            self._processing_status = dict(status)
+            self._refresh_processing_labels()
+
+    def apply_device_fallback(self, missing):
+        if self._settings.device == missing:
+            self._settings = replace(self._settings, device="auto")
+        if self.device.currentData() == missing:
+            updating = self._updating
+            self._updating = True
+            self.device.setCurrentIndex(self.device.findData("auto"))
+            self._updating = updating
+
     def _refresh_labels(self):
         self.duration_label.setText(f"{self.duration.value()/2:g} s")
         self.fade_options.setEnabled(self.crossfade.isChecked())
         self.eq_box.setEnabled(self.equalizer.isChecked())
         self.preset.setEnabled(self.equalizer.isChecked())
         self.reset.setEnabled(self.equalizer.isChecked())
+        self.preamp.setEnabled(self.equalizer.isChecked())
+        self.auto_headroom.setEnabled(self.equalizer.isChecked())
+        self.preamp_value.setText(f"{self.preamp.value()/2:+g} dB" if self.preamp.value() else "0 dB")
+        self.analysis.setEnabled(self.normalization.currentData() != "off")
+        self.analysis_hint.setEnabled(self.normalization.currentData() != "off")
         self.normalization_hint.setText({
-            "off": "Play songs at their original loudness.",
-            "track": "Balance loudness between songs, useful for shuffled or mixed playlists.",
-            "album": "Balance loudness between albums while preserving quieter and louder songs within each album.",
+            "off": "Play without a loudness adjustment. Your analysis preference is kept for later.",
+            "track": "Balance loudness between songs using their loudness data. Each song keeps a steady adjustment while it plays.",
+            "album": "Use album loudness tags to keep the volume differences within an album. If unavailable, use track loudness data instead.",
         }.get(self.normalization.currentData(), ""))
         for slider, label in zip(self.bands, self.values, strict=True):
             label.setText(f"{slider.value()/2:+g}" if slider.value() else "0")
         gains = tuple(slider.value()/2 for slider in self.bands)
+        self._refresh_processing_labels()
         preset = next((name for name, values in EQ_PRESETS.items() if gains == values), "Custom")
         self.preset.blockSignals(True)
         self.preset.setCurrentText(preset)
@@ -243,8 +310,40 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
 
     def _controls_changed(self, *_args):
         if not self._updating:
+            if self.sender() is not self.duration:
+                self._processing_status = None
             self._refresh_labels()
-            self._commit_timer.start()
+            if not self._commit_timer.isActive():
+                self._commit_timer.start()
+
+    def _discrete_changed(self, *_args):
+        if not self._updating:
+            if self.sender() not in (self.gapless, self.crossfade, self.preserve):
+                self._processing_status = None
+            self._refresh_labels()
+            self._commit()
+
+    def _refresh_processing_labels(self):
+        status = self._processing_status or {}
+        reduction = status.get("headroom_db")
+        net_gain = status.get("net_preamp_db")
+        finite = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        if not self.equalizer.isChecked():
+            self.headroom_hint.setText("Enable the equalizer to apply the preamp and band settings.")
+        elif finite(reduction) and finite(net_gain):
+            extra = " Based on a conservative peak estimate." if status.get("peak_source") == "unknown" and self.auto_headroom.isChecked() else ""
+            self.headroom_hint.setText(f"Headroom reduction: {max(0, reduction):.1f} dB. Gain before EQ: {net_gain:+.1f} dB.{extra}")
+        elif self.auto_headroom.isChecked():
+            self.headroom_hint.setText("Required headroom is calculated during playback using the song's peak level and your current gains.")
+        else:
+            self.headroom_hint.setText("Automatic headroom is off. The preamp and band gains are applied as set.")
+        if status.get("bypass"):
+            text = "TrackIndex processing is bypassed. Your audio device may still convert the format."
+        elif not self.peak_protection.isChecked():
+            text = "Peak protection is off. Strong boosts can overload the output."
+        else:
+            text = "Peak protection is enabled after playback gain."
+        self.processing_status.setText(text)
 
     def _bands_changed(self):
         self._controls_changed()
@@ -256,6 +355,7 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
         for slider, gain in zip(self.bands, EQ_PRESETS[name], strict=True):
             slider.setValue(round(gain * 2))
         self._updating = False
+        self._processing_status = None
         self._refresh_labels()
         self._commit()
 
@@ -265,7 +365,9 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
             return
         value = AudioSettings(
             gapless=self.gapless.isChecked(), normalization=self.normalization.currentData(),
+            analysis_enabled=self.analysis.isChecked(), peak_protection=self.peak_protection.isChecked(),
             eq_enabled=self.equalizer.isChecked(), eq_gains=tuple(s.value()/2 for s in self.bands),
+            eq_preamp=self.preamp.value()/2, eq_auto_headroom=self.auto_headroom.isChecked(),
             crossfade=self.crossfade.isChecked(), crossfade_seconds=self.duration.value()/2,
             preserve_albums=self.preserve.isChecked(), device=self.device.currentData() or "auto",
         )
@@ -289,16 +391,22 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
             section.setSpacing(round(6*scale))
         self.fade_layout.setContentsMargins(round(24*scale), round(4*scale), 0, 0)
         self.fade_layout.setSpacing(round(6*scale))
-        self.normalization.setFixedWidth(round(126*scale))
+        self.normalization.setMinimumWidth(0)
         self.duration_label.ensurePolished()
         metrics = self.duration_label.fontMetrics()
         self.duration_label.setFixedWidth(max(
             metrics.horizontalAdvance(f"{value/2:g} s")
             for value in range(self.duration.minimum(), self.duration.maximum() + 1)
         ) + round(2*scale))
+        self.preamp_value.ensurePolished()
+        self.preamp_value.setFixedWidth(max(
+            self.preamp_value.fontMetrics().horizontalAdvance(f"{value/2:+g} dB")
+            for value in range(self.preamp.minimum(), self.preamp.maximum() + 1)
+        ) + round(2*scale))
         for combo in (self.normalization, self.preset, self.device):
             combo.set_theme(theme, scale)
-        for check in (self.gapless, self.crossfade, self.preserve, self.equalizer):
+        for check in (self.gapless, self.crossfade, self.preserve, self.equalizer, self.auto_headroom,
+                      self.analysis, self.peak_protection):
             if check not in self._control_styles:
                 style = SquareCheckBoxStyle(border_color=theme.border, fill_color=theme.accent,
                                             check_color=theme.text_primary)
@@ -308,7 +416,7 @@ class AudioPanel(RestoreCursorOnHide, QFrame):
             style = self._control_styles[check]
             style.set_colors(border_color=theme.border, fill_color=theme.accent, check_color=theme.text_primary)
             style.set_metrics(size=round(18*scale), radius=3)
-        for slider in (self.duration,):
+        for slider in (self.duration, self.preamp):
             if slider not in self._control_styles:
                 style = RoundHandleSliderStyle(handle_color=theme.text_primary, border_color=theme.border,
                                                groove_color=theme.border, fill_color=theme.accent, parent=slider)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from itertools import chain
 from pathlib import Path
 
 
@@ -125,6 +126,32 @@ class PlaybackQueue:
 
     def entry(self, track_id: str) -> QueueEntry | None:
         return next((entry for entry in self.entries if entry.track_id == track_id), None)
+
+    def upcoming_entries(self, limit: int = 8) -> tuple[QueueEntry, ...]:
+        current = self.current
+        if current is None or limit <= 0:
+            return ()
+        by_id = {entry.track_id: entry for entry in self.entries}
+        result = [] if current.track_id in self.unavailable else [current]
+        if self.repeat is RepeatMode.ONE:
+            return tuple(result)
+        if self.shuffle:
+            candidates = iter(self._future)
+        else:
+            ids = tuple(by_id)
+            position = ids.index(current.track_id) + 1
+            candidates = chain(ids[position:], ids[:position] if self.repeat is RepeatMode.ALL else ())
+        seen = {current.track_id}
+        for track_id in candidates:
+            if len(result) >= limit:
+                break
+            if track_id in seen or track_id in self.unavailable:
+                continue
+            entry = by_id.get(track_id)
+            if entry is not None:
+                seen.add(track_id)
+                result.append(entry)
+        return tuple(result)
 
     def set_shuffle(self, enabled: bool) -> None:
         enabled = bool(enabled)

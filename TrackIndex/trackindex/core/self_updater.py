@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..update_cleanup import PreparationLease, discard_staging, maintain_updates
+
 import hashlib
 import json
 import os
@@ -9,8 +11,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.client import IncompleteRead
 from pathlib import Path
 from threading import Event
@@ -41,7 +42,6 @@ _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 _UPDATE_STAGING_RE = re.compile(r"^trackindex-update-[0-9a-f]{32}$")
-_UPDATE_FILES = ("TrackIndexSetup.exe", "TrackIndexSetup.exe.tmp", "UpdateHelper.exe")
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +74,7 @@ class UpdateCheckData:
 
 @dataclass(frozen=True, slots=True)
 class PreparedUpdate:
+    _preparation: PreparationLease | None = field(default=None, repr=False, compare=False, kw_only=True)
     setup_path: Path
     latest_version: str
     setup_sha256: str = ""
@@ -305,6 +306,7 @@ def prepare_update(
         raise RuntimeError("Update staging cannot use a link or junction.")
     root = staging_root / f"trackindex-update-{uuid.uuid4().hex}"
     root.mkdir(parents=True, exist_ok=False)
+    protection = PreparationLease(root)
     target = root / "TrackIndexSetup.exe"
     temporary = target.with_suffix(".exe.tmp")
     request = Request(check.setup_url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}", "Accept": "*/*"})
@@ -346,9 +348,11 @@ def prepare_update(
             check.setup_size,
             _installer_mode() == "/ALLUSERS",
             check.notes,
+            _preparation=protection,
         )
     except Exception:
-        _remove_staged_update(root, staging_root)
+        protection.close()
+        discard_staging(root, staging_root)
         raise
 
 
@@ -393,57 +397,17 @@ def launch_prepared_update(prepared: PreparedUpdate, *, restart_after_update: bo
                current_version=APP_VERSION, notes=prepared.notes, install_dir=app_dir(),
                mode=_installer_mode(), restart=restart_after_update,
                staging_root=update_root)
+    if prepared._preparation is not None:
+        prepared._preparation.close()
 
 
 def discard_prepared_update(prepared: PreparedUpdate) -> None:
     if prepared.setup_path.name != "TrackIndexSetup.exe":
         return
-    _remove_staged_update(prepared.setup_path.parent, product_data_dir())
-
-
-def _remove_staged_update(folder: Path, storage: Path) -> None:
-    if (
-        not _UPDATE_STAGING_RE.fullmatch(folder.name.casefold())
-        or is_link_like(storage)
-        or is_link_like(folder)
-    ):
-        return
-    try:
-        if folder.resolve(strict=True).parent != storage.resolve(strict=True) or not folder.is_dir():
-            return
-        for name in _UPDATE_FILES:
-            child = folder / name
-            if not is_link_like(child) and child.is_file():
-                child.unlink(missing_ok=True)
-        folder.rmdir()
-    except (OSError, RuntimeError):
-        return
+    if prepared._preparation is not None:
+        prepared._preparation.close()
+    discard_staging(prepared.setup_path.parent, product_data_dir())
 
 
 def cleanup_old_update_staging(max_age_days: int = 1) -> None:
-    root = product_data_dir()
-    if not root.exists() or is_link_like(root):
-        return
-    threshold = time.time() - max_age_days * 86400
-    for storage in (root, root / "updates"):
-        if is_link_like(storage) or not storage.is_dir():
-            continue
-        try:
-            children = tuple(storage.iterdir())
-        except OSError:
-            continue
-        for child in children:
-            try:
-                if (
-                    not _UPDATE_STAGING_RE.fullmatch(child.name.casefold())
-                    or is_link_like(child)
-                    or not child.is_dir()
-                    or child.stat().st_mtime >= threshold
-                ):
-                    continue
-                _remove_staged_update(child, storage)
-            except OSError:
-                continue
-        if storage != root:
-            with suppress(OSError):
-                storage.rmdir()
+    maintain_updates(product_data_dir(), max_age_days=max_age_days)

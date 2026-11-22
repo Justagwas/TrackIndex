@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from ctypes import c_char_p, c_int, c_uint64, c_void_p
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -9,6 +10,10 @@ from importlib import import_module
 from pathlib import Path
 from threading import RLock
 from typing import Any, Protocol
+
+from .diagnostics import diagnostics_logger
+
+_LOG = diagnostics_logger("playback")
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +119,7 @@ class LibMpvBackend:
         self._pending_lookahead_generation = 0
         self._gain_future = None
         self._gain_volume = None
+        self._hook_continue = None
 
     @property
     def available(self) -> bool:
@@ -164,6 +170,16 @@ class LibMpvBackend:
             self._observe("audio-device", "device")
             self._event_handler = self._on_event
             self._player.register_event_callback(self._event_handler)
+            if callable(getattr(self, "before_audio", None)):
+                hook_add = mpv.backend.mpv_hook_add
+                hook_add.argtypes = [c_void_p, c_uint64, c_char_p, c_int]
+                hook_add.restype = c_int
+                self._hook_continue = mpv.backend.mpv_hook_continue
+                self._hook_continue.argtypes = [c_void_p, c_uint64]
+                self._hook_continue.restype = c_int
+                result = hook_add(self._player._event_handle, 1, b"on_preloaded", 50)
+                if result < 0:
+                    raise RuntimeError("The audio runtime does not support safe gain preparation.")
             callback(BackendEvent("ready"))
         except Exception as exc:
             self._error = str(exc) or exc.__class__.__name__
@@ -182,7 +198,19 @@ class LibMpvBackend:
 
     def _on_event(self, event: object) -> None:
         event_id = _integer_value(getattr(event, "event_id", None))
-        if event_id == 8:
+        if event_id == 25 and self._hook_continue is not None:
+            hook_id = getattr(getattr(event, "data", None), "id", 0)
+            try:
+                self.before_audio(self)
+            except Exception:
+                _LOG.exception("Audio processing preparation failed")
+                with suppress(Exception):
+                    self._player.pause = True
+                    self._player.command_async("stop")
+                self._emit("error", "Audio processing could not be prepared. Try playing the song again.")
+            finally:
+                self._hook_continue(self._player._event_handle, hook_id)
+        elif event_id == 8:
             self._emit("loaded", generation=self._active_generation())
         elif event_id == 6:
             entry_id = _integer_value(
@@ -380,6 +408,7 @@ class LibMpvBackend:
         self._player = None
         self._gain_future = None
         self._gain_volume = None
+        self._hook_continue = None
         self._observers.clear()
         self._event_handler = None
         with self._event_lock:

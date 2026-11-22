@@ -115,7 +115,7 @@ class ShutdownCoordinator(QObject):
                     _LOG.exception("Installer handoff failure could not be displayed")
         finally:
             self.state = ShutdownState.READY
-            self.app.quit()
+            self.app.exit(0)
 
     def _emergency_teardown(self) -> None:
         if self.state is not ShutdownState.READY:

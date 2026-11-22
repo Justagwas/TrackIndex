@@ -14,6 +14,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QInputDialog, QMessageBox
 
 from trackindex.ui.update_dialog import get_update_dialog, ask_update_install_preference, ask_update_handoff, show_update_failure, show_update_notice
+from trackindex.ui.update_maintenance import defer_during_update_recovery
 from trackindex.controller.coordination_services import (
     LibraryCoordinationService,
     LibrarySnapshot,
@@ -23,6 +24,7 @@ from trackindex.controller.coordination_services import (
     TransactionOperationContext,
     UpdateCoordinationService,
 )
+from trackindex.controller.track_finder import TrackFinder
 from trackindex.core import self_updater
 from trackindex.core.artwork_service import ArtworkStore, PreparedArtwork
 from trackindex.core.concurrency import ReadWriteLock
@@ -195,6 +197,7 @@ class AppController(QObject):
         self._shutdown_finalizing = False
         self._shutdown_saved = False
         self._shutdown_settled = True
+        self._finder = TrackFinder(self)
         self._connect()
         self._refresh_libraries()
         self.app.aboutToQuit.connect(self.shutdown)
@@ -598,6 +601,7 @@ class AppController(QObject):
         self.audit_pool.start(task)
 
     def _invalidate_library_work(self) -> int:
+        self._finder.invalidate()
         self._invalidate_setup_preview()
         self.generation += 1
         generation = self.generation
@@ -834,6 +838,7 @@ class AppController(QObject):
         first, last = self.window.track_table.visible_row_range()
         self._activate_metadata_window(first, last)
         self._pump_metadata_tasks()
+        self._finder.refresh()
 
     @staticmethod
     def _prioritized_metadata_ids(
@@ -1667,6 +1672,7 @@ class AppController(QObject):
             self._reconcile_task.stop()
             self._reconcile_task = None
         self._metadata_paused = True
+        self._finder.invalidate()
         for metadata_task in self._metadata_tasks.values():
             metadata_task.stop()
         self.metadata_pool.clear()
@@ -2269,6 +2275,8 @@ class AppController(QObject):
         assert_qt_thread_affinity(self)
         if self._shutdown_started:
             return
+        if defer_during_update_recovery(self.window, lambda: self._update_check_completed(check)):
+            return
         if not check.update_available:
             if self._updates.manual:
                 show_update_notice(self.window, "You are up to date", "You are using the latest version of TrackIndex.")
@@ -2298,6 +2306,8 @@ class AppController(QObject):
         if self._shutdown_started:
             return
         if self._updates.manual:
+            if defer_during_update_recovery(self.window, lambda: self._update_check_failed(message)):
+                return
             self._show_update_install_failure("Could not check for updates.\n" + message)
 
     def _start_update_install(self, check) -> None:
@@ -2523,6 +2533,7 @@ class AppController(QObject):
         self._mutations.abandon_transaction()
 
     def _stop_library_work(self) -> None:
+        self._finder.stop()
         self._metadata_flush_timer.stop()
         if self._audit_task is not None:
             self._audit_task.stop()
@@ -2540,7 +2551,7 @@ class AppController(QObject):
         self.shutdown_drained()
 
     def shutdown_drained(self) -> bool:
-        pools = (self.audit_pool, self.metadata_pool, self.prefetch_pool, self.transaction_pool)
+        pools = (self.audit_pool, self.metadata_pool, self.prefetch_pool, self.transaction_pool, self._finder.pool)
         if not all(pool.waitForDone(0) for pool in pools):
             return False
         if any(thread is not None and not thread.wait(0) for thread in (self._discovery_thread, self._update_thread)):

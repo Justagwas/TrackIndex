@@ -51,6 +51,7 @@ Want that order to appear in File Explorer too? TrackIndex can add numbers to yo
 - **Order beyond the app:** Optional numbered filenames and M3U/M3U8 playlist files.
 - **Built-in music player:** Artwork, track details, seeking, shuffle, repeat and a compact view.
 - **Undo and redo:** Reordering, added or removed tracks, and playlist changes while TrackIndex is open.
+- **Find tracks:** Search filenames, titles, artists and albums without filtering the library or changing its order.
 - **Background loading:** Artwork and track details load as you browse, prioritizing the tracks in view.
 - **Standalone option:** Run without installation, alongside the regular Windows installer.
 
@@ -82,6 +83,16 @@ If an existing playlist and filenames disagree, setup asks which order to use. T
 Compact the player to leave more room for the library. Compatible keyboard and Windows media controls also work in the background.
 
 Shuffle affects playback only, leaving the saved library order unchanged. After successfully saved library changes, the queue updates while keeping the current song where possible.
+
+Open **Audio settings** from the player or Settings to adjust transitions, loudness, the equalizer and audio output. **Track** normalization balances songs individually; **Album** uses album loudness tags to preserve their volume differences, falling back to track data when needed. Automatic analysis checks upcoming songs when loudness data is missing and saves the results locally.
+
+The equalizer responds while you move its controls. **Preamp**, optional **Auto headroom** and the displayed gain reduction let you manage boosts. **Peak protection** is separate and accounts for playback volume before reducing high peaks. Turning off the equalizer, normalization and peak protection bypasses those effects; the audio device may still convert the format. If a saved output is unavailable, TrackIndex uses **System default**.
+
+### Finding tracks
+
+Press **Ctrl+F** or select the search icon beside the playlist heading. Search by filename, title, artist or album, then use **Enter** for the next match or **Shift+Enter** for the previous one. **Escape** closes Find.
+
+Find selects and scrolls to matching tracks without changing the library order or playback.
 
 ### Undo, removal and recovery
 

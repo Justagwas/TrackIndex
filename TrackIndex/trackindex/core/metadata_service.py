@@ -152,6 +152,7 @@ def read_track_metadata(
     path: Path,
     fallback_artwork: bytes | None = None,
     backend: tuple[Any | None, tuple[type, ...], str] | None = None,
+    *, include_artwork: bool = True,
 ) -> TrackMetadata:
     _, fallback_title = parse_filename_index(path)
     try:
@@ -180,7 +181,7 @@ def read_track_metadata(
             artist=artist,
             album=album,
             duration_seconds=float(length) if length else None,
-            artwork_bytes=_embedded_art(audio) or fallback_artwork,
+            artwork_bytes=(_embedded_art(audio) or fallback_artwork) if include_artwork else None,
             container=path.suffix.removeprefix(".").upper(),
             codec=codec,
             bitrate=int(bitrate) if bitrate else None,
@@ -189,7 +190,7 @@ def read_track_metadata(
             channels=int(channels) if channels else None,
         )
     except Exception as exc:
-        return TrackMetadata(fallback_title, artwork_bytes=fallback_artwork, error=str(exc))
+        return TrackMetadata(fallback_title, artwork_bytes=fallback_artwork if include_artwork else None, error=str(exc))
 
 
 class MetadataCache:

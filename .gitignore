@@ -27,3 +27,4 @@ dist/
 /TrackIndex/vendor/
 /TrackIndex/native/libmpv/*.dll
 /tests/
+/scripts/

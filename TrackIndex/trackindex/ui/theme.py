@@ -64,6 +64,14 @@ QLabel#sectionTitle {{ font: 700 {pt(9.4):.1f}pt "Segoe UI"; }}
 QLabel#settingsCardTitle {{ color: {theme.text_primary}; font: 700 {pt(9.2):.1f}pt "Segoe UI"; }}
 QLabel#settingsSubtext {{ color: {theme.text_secondary}; font: 650 {pt(9.5):.1f}pt "Segoe UI"; padding-top: {px(1)}px; padding-bottom: {px(1)}px; }}
 QLabel#playlistCaption {{ color: {theme.text_secondary}; font: 700 {pt(8.4):.1f}pt "Segoe UI"; }}
+QFrame#findBar {{ background: {theme.panel_bg}; border: 1px solid {theme.border}; border-radius: {px(9)}px; }}
+QLabel#findCount {{ color: {theme.text_secondary}; font: 600 {pt(8.4):.1f}pt "Segoe UI"; }}
+QPushButton#findIcon {{ background: transparent; border: 1px solid transparent; border-radius: {px(6)}px; padding: 0; margin: 0; }}
+QPushButton#findIcon:hover {{ background: {theme.app_bg}; border-color: transparent; }}
+QPushButton#findIcon:pressed {{ background: {theme.disabled_bg}; }}
+QPushButton#findIcon[keyboardFocus="true"]:focus {{ border-color: {theme.text_secondary}; }}
+QPushButton#findIcon:disabled {{ background: transparent; border-color: transparent; }}
+QLineEdit#findInput:focus {{ border-color: {theme.accent}; }}
 QLabel#footerVersion {{ color: {theme.text_secondary}; font: 650 {pt(9.2):.1f}pt "Segoe UI"; }}
 QLabel#warning {{ color: {theme.warning}; font: 650 {pt(8.8):.1f}pt "Segoe UI"; }}
 QLabel#setupSectionLabel {{ color: {theme.text_secondary}; font: 700 {pt(8.4):.1f}pt "Segoe UI"; }}

@@ -22,9 +22,13 @@ def _number(value: object, default: float, low: float, high: float) -> float:
 @dataclass(frozen=True, slots=True)
 class AudioSettings:
     gapless: bool = True
-    normalization: str = "off"
+    normalization: str = "track"
+    analysis_enabled: bool = True
+    peak_protection: bool = True
     eq_enabled: bool = False
     eq_gains: tuple[float, ...] = (0.0,) * 10
+    eq_preamp: float = 0.0
+    eq_auto_headroom: bool = True
     crossfade: bool = False
     crossfade_seconds: float = 5.0
     preserve_albums: bool = True
@@ -35,14 +39,20 @@ class AudioSettings:
         data = value if isinstance(value, dict) else {}
         defaults = cls()
         flags = {key: data[key] if type(data.get(key)) is bool else getattr(defaults, key)
-                 for key in ("gapless", "eq_enabled", "crossfade", "preserve_albums")}
+                 for key in ("gapless", "peak_protection", "eq_enabled", "eq_auto_headroom", "crossfade", "preserve_albums")}
         gains = data.get("eq_gains")
         gains = gains if isinstance(gains, (list, tuple)) and len(gains) == 10 else defaults.eq_gains
         device = data.get("device", "auto")
+        mode = data.get("normalization")
+        analysis = data.get("analysis_enabled")
+        if type(analysis) is not bool:
+            analysis = mode not in ("track", "album")
         return cls(
             **flags,
-            normalization=data.get("normalization") if data.get("normalization") in ("off", "track", "album") else "off",
+            normalization=mode if mode in ("off", "track", "album") else defaults.normalization,
+            analysis_enabled=analysis,
             eq_gains=tuple(round(_number(v, 0, -12, 12) * 2) / 2 for v in gains),
+            eq_preamp=round(_number(data.get("eq_preamp"), 0, -12, 12) * 2) / 2,
             crossfade_seconds=round(_number(data.get("crossfade_seconds"), 5, 1, 12) * 2) / 2,
             device=device if isinstance(device, str) and 0 < len(device) <= 1024 and "\0" not in device else "auto",
         )
@@ -52,37 +62,97 @@ class AudioSettings:
 
 
 @lru_cache(maxsize=128)
-def eq_headroom(gains: tuple[float, ...]) -> float:
-    if not any(gains):
+def eq_headroom(gains: tuple[float, ...], sample_rate: int = 48000) -> float:
+    sample_rate = max(48000, min(768000, sample_rate))
+    if not any(gain > 0 for gain in gains):
         return 0.0
+    if sum(gain != 0 for gain in gains) == 1:
+        return max(gains)
     filters = []
     for frequency, gain in zip(EQ_FREQUENCIES, gains, strict=True):
-        w = 2 * math.pi * frequency / 48000
+        if not gain:
+            continue
+        w = 2 * math.pi * frequency / sample_rate
         amplitude = 10 ** (gain / 40)
         alpha = math.sin(w) * math.sinh(math.log(2) / 2 * w / math.sin(w))
         filters.append(((1 + alpha * amplitude, -2 * math.cos(w), 1 - alpha * amplitude),
                         (1 + alpha / amplitude, -2 * math.cos(w), 1 - alpha / amplitude)))
     peak = 1.0
-    frequencies = (0, 24000, *EQ_FREQUENCIES,
-                   *(20 * 1200 ** (index / 2048) for index in range(2049)))
+    nyquist = sample_rate / 2
+    frequencies = (0, nyquist, *EQ_FREQUENCIES,
+                   *(20 * (nyquist / 20) ** (index / 2048) for index in range(2049)))
     for frequency in frequencies:
-        z = cmath.exp(-2j * math.pi * frequency / 48000)
+        z = cmath.exp(-2j * math.pi * frequency / sample_rate)
         response = 1.0
         for b, a in filters:
             response *= abs((b[0] + b[1] * z + b[2] * z*z) / (a[0] + a[1] * z + a[2] * z*z))
         peak = max(peak, response)
-    return 20 * math.log10(peak) + 1.0
+    return 20 * math.log10(peak)
 
 
-def audio_filters(settings: AudioSettings) -> str:
-    filters = []
-    if settings.eq_enabled and any(settings.eq_gains):
-        filters.append(f"volume={-eq_headroom(settings.eq_gains):.4f}dB")
-        filters.extend(f"equalizer=f={frequency}:t=o:w=1:g={gain}"
-                       for frequency, gain in zip(EQ_FREQUENCIES, settings.eq_gains, strict=True) if gain)
-    if settings.eq_enabled or settings.normalization != "off" or settings.crossfade:
+@dataclass(frozen=True, slots=True)
+class ProcessingPlan:
+    preamp_db: float
+    master_db: float
+    normalization_db: float
+    bands: tuple[float, ...]
+    headroom_db: float
+    sample_rate: int
+    protection: bool
+    bypass: bool
+
+    @property
+    def values(self) -> tuple[float, ...]:
+        return (self.preamp_db, self.master_db, *self.bands)
+
+
+def processing_plan(settings: AudioSettings, normalization_gain: float = 0.0, *,
+                    master_gain_db: float = 0.0, source_peak_dbfs: float | None = None,
+                    sample_rate: int = 48000,
+                    normalization_active: bool | None = None) -> ProcessingPlan:
+    gain = _number(normalization_gain, 0, -60, 24) if settings.normalization != "off" else 0.0
+    master = _number(master_gain_db, 0, -150, 0)
+    rate = max(48000, min(768000, sample_rate)) if settings.eq_enabled else 0
+    bands = settings.eq_gains if settings.eq_enabled else (0.0,) * 10
+    peak = (_number(source_peak_dbfs, 0, -150, 50)
+            if source_peak_dbfs is not None else 0.0)
+    manual = settings.eq_preamp if settings.eq_enabled else 0.0
+    if normalization_active is None:
+        normalization_active = bool(gain)
+    if (settings.peak_protection and settings.normalization != "off"
+            and normalization_active and source_peak_dbfs is not None):
+        gain = max(-60.0, min(gain, -1.0 - peak - manual))
+    normalized = gain
+    reduction = 0.0
+    if settings.eq_enabled:
+        gain += manual
+        response = eq_headroom(settings.eq_gains, rate)
+        if settings.eq_auto_headroom and manual + response > 0:
+            ceiling = -1.0 if settings.peak_protection else 0.0
+            reduction = max(0.0, peak + gain + response - ceiling)
+            gain -= reduction
+    bypass = not settings.eq_enabled and settings.normalization == "off" and not settings.peak_protection
+    return ProcessingPlan(gain, master, normalized, bands, reduction, rate, settings.peak_protection, bypass)
+
+
+def processing_values(settings: AudioSettings, normalization_gain: float = 0.0, **kwargs) -> tuple[float, ...]:
+    return processing_plan(settings, normalization_gain, **kwargs).values
+
+
+def audio_filters(settings: AudioSettings, normalization_gain: float = 0.0, **kwargs) -> str:
+    plan = processing_plan(settings, normalization_gain, **kwargs)
+    if plan.bypass:
+        return ""
+    filters = ([f"aresample={plan.sample_rate}:osf=fltp"] if settings.eq_enabled
+               else ["aformat=sample_fmts=fltp"])
+    filters.append(f"volume@preamp={plan.preamp_db:.6f}dB")
+    if settings.eq_enabled:
+        filters.extend(f"equalizer@band{index}=f={frequency}:t=o:w=1:g={gain}"
+                       for index, (frequency, gain) in enumerate(zip(EQ_FREQUENCIES, plan.bands, strict=True)))
+    filters.append(f"volume@master={plan.master_db:.6f}dB")
+    if plan.protection:
         filters.append("alimiter=limit=0.891250938:level=false:latency=true")
-    return "@trackindex:lavfi=[" + ",".join(filters) + "]" if filters else ""
+    return "@trackindex:lavfi=[" + ",".join(filters) + "]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,4 +197,6 @@ def fade_duration(requested: float, outgoing: float, incoming: float) -> float:
 
 def fade_weights(progress: float) -> tuple[float, float]:
     angle = max(0.0, min(1.0, progress)) * math.pi / 2
-    return math.cos(angle), math.sin(angle)
+    outgoing, incoming = math.cos(angle), math.sin(angle)
+    total = outgoing + incoming
+    return outgoing / total, incoming / total

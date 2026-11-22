@@ -60,6 +60,7 @@ from .interaction import (
 )
 from .library_list import LibraryList
 from .footer import FooterButton, build_footer_icon, build_footer_stylesheet, describe_footer_button
+from .find_bar import FindBar, build_find_icon
 from .player_panel import PlayerPanel
 from .settings_panel import SettingsPanel
 from .setup_panel import LibrarySetupPanel
@@ -96,6 +97,11 @@ class MainWindow(QMainWindow):
     setupCancelRequested = Signal()
     orderingMethodRequested = Signal(str)
     prefixRemovalRequested = Signal()
+    findRequested = Signal()
+    findQueryChanged = Signal(str)
+    findNavigateRequested = Signal(int)
+    findClosed = Signal()
+    librarySavingChanged = Signal(bool)
 
     def __init__(self, theme: ThemePalette, *, theme_mode: str, ui_scale_percent: int,
                  auto_updates: bool, window_pinned: bool, music_root: str = "",
@@ -124,6 +130,7 @@ class MainWindow(QMainWindow):
         self._audit_blocked = False
         self._closing = False
         self._restore_track_focus_after_save = False
+        self._find_available = False
         self.setWindowTitle(APP_NAME)
         self.resize(1000, 720)
         self.setMinimumSize(self._minimum_window_width(), 600)
@@ -204,14 +211,27 @@ class MainWindow(QMainWindow):
         self.overflow_button.clicked.connect(self._show_overflow)
         header.addWidget(self.overflow_button, 0, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.library_header_info, 1)
-
-
+        self.find_button = FooterButton("", main)
+        self.find_button.setObjectName("findIcon")
+        describe_footer_button(self.find_button, "Find tracks", "Find tracks in this playlist (Ctrl+F)")
+        self.find_button.setEnabled(False)
+        self.find_button.clicked.connect(self.show_find)
+        header.addWidget(self.find_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        self._find_shortcut.activated.connect(self.show_find)
         self.save_status = QLabel("", main)
         self.save_status.setObjectName("muted")
         self.save_status.setWordWrap(True)
         self.save_status.hide()
         layout.addLayout(header)
         layout.addWidget(self.save_status)
+        self.find_bar = FindBar(main)
+        self.find_bar.queryChanged.connect(self.findQueryChanged.emit)
+        self.find_bar.navigateRequested.connect(self.findNavigateRequested.emit)
+        self.find_bar.closeRequested.connect(self.hide_find)
+        self.find_bar.resizedDuringAnimation.connect(self._sync_audio_geometry)
+        self.find_bar.expansionFinished.connect(self._find_expansion_finished)
+        layout.addWidget(self.find_bar)
 
         self.authority_banner = QFrame(main)
         self.authority_banner.setObjectName("authorityBanner")
@@ -450,6 +470,54 @@ class MainWindow(QMainWindow):
     def set_libraries(self, libraries: list[LibraryRecord], selected_id: str = "") -> None:
         self.library_list.set_libraries(libraries, selected_id)
 
+    def show_find(self) -> None:
+        if not self._find_available:
+            return
+        self.player_panel._info_popup.hide()
+        self._audio_restore_focus = False
+        if self._requested_surface != "none":
+            self._request_surface("none")
+        self.find_bar.set_expanded(True)
+        self.find_bar.input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.find_bar.input.selectAll()
+        self.findRequested.emit()
+
+    def hide_find(self, *, restore_focus: bool = True, animate: bool = True) -> None:
+        if not self.find_bar.is_expanded:
+            if not animate:
+                self.find_bar.set_expanded(False, animate=False)
+            return
+        focus = QApplication.focusWidget()
+        restore_focus = restore_focus and focus is not None and (focus is self.find_bar or self.find_bar.isAncestorOf(focus))
+        self.find_bar.set_expanded(False, animate=animate)
+        self.findClosed.emit()
+        if restore_focus and self.track_table.isEnabled():
+            self.track_table.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def set_find_available(self, available: bool) -> None:
+        self._find_available = bool(available) and not self._closing
+        self.find_button.setEnabled(self._find_available)
+        self.find_bar.setEnabled(self._find_available)
+        sync_pointer_cursor(self.find_button)
+
+    def _find_expansion_finished(self) -> None:
+        QTimer.singleShot(0, self, self._ensure_find_selection_visible)
+
+    def _ensure_find_selection_visible(self) -> None:
+        focus = QApplication.focusWidget()
+        if (self.find_bar.is_expanded and self.find_bar.query.strip()
+                and focus is not None and self.find_bar.isAncestorOf(focus)
+                and self.track_table.isEnabled() and self.track_table._drag is None):
+            index = self.track_table.currentIndex()
+            if index.isValid():
+                self.track_table.scrollTo(index)
+
+    def set_find_results(self, current: int, total: int, *, pending: bool = False) -> None:
+        self.find_bar.set_results(current, total, pending=pending)
+
+    def select_find_track(self, track_id: str) -> bool:
+        return self.track_table.select_find_track(track_id)
+
     def set_audit(self, audit: AuditResult, record: LibraryRecord | None = None) -> None:
         by_id = audit.track_map()
         tracks = [by_id[item] for item in audit.display_order]
@@ -511,6 +579,8 @@ class MainWindow(QMainWindow):
         plan=None,
         *, pending: bool = False,
     ) -> None:
+        self.hide_find(restore_focus=False)
+        self.set_find_available(False)
         self._current_library_id = record.library_id
         self._current_storage_mode = mode
         self._has_filename_prefixes = any(track.filename_index is not None for track in audit.tracks)
@@ -533,6 +603,7 @@ class MainWindow(QMainWindow):
         if not self._closing:
             self.save_status.hide()
         self.overflow_button.setVisible(visible)
+        self.find_button.setVisible(visible)
 
     def _show_library_state(self, title: str, detail: str = "") -> None:
         self.empty_label.setText(title)
@@ -619,8 +690,10 @@ class MainWindow(QMainWindow):
             self._restore_track_focus_after_save = False
             if self.track_table.isEnabled() and QApplication.focusWidget() is None:
                 self.track_table.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.librarySavingChanged.emit(saving)
 
     def set_closing_status(self, message: str = "Closing...") -> None:
+        self.hide_find(restore_focus=False, animate=False)
         self._closing = True
         self.setEnabled(False)
         self.save_status.setText(message)
@@ -722,6 +795,8 @@ class MainWindow(QMainWindow):
     def _request_surface(self, target: str) -> None:
         if self._closing:
             return
+        if target != "none":
+            self.hide_find(restore_focus=False)
         self._requested_surface = target
         self._settings_visible = target == "settings"
         self.settings_toggle_button.setChecked(self._settings_visible)
@@ -967,6 +1042,11 @@ class MainWindow(QMainWindow):
         self._refresh_theme_toggle_icon()
         self._refresh_pin_toggle_icon()
         self._refresh_playlist_actions_icon()
+        find_size = max(16, round(18 * scale))
+        self.find_button.setFixedSize(max(22, round(30 * scale)), max(22, round(30 * scale)))
+        self.find_button.setIconSize(QSize(find_size, find_size))
+        self.find_button.setIcon(build_find_icon("search", theme.text_primary, find_size))
+        self.find_bar.set_appearance(theme, scale)
         self.track_table.set_appearance(theme, ui_scale_percent / 100)
         self.player_panel.set_appearance(theme, ui_scale_percent / 100)
         self.library_list.set_appearance(theme, ui_scale_percent / 100)
@@ -1142,6 +1222,16 @@ class MainWindow(QMainWindow):
         self.settings_panel.refresh_cursor_state()
 
     def eventFilter(self, watched, event):
+        if hasattr(self, "find_bar") and self.find_bar.is_expanded:
+            if (isinstance(watched, QWidget) and watched.window() is self
+                    and QApplication.activeModalWidget() is None
+                    and QApplication.activePopupWidget() is None):
+                if (event.type() in {QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress}
+                        and event.key() == Qt.Key.Key_Escape):
+                    event.accept()
+                    if event.type() == QEvent.Type.KeyPress:
+                        self.hide_find()
+                    return True
         if self._audio_panel is not None:
             if watched in (self.main_panel, self.player_panel) and event.type() in {
                 QEvent.Type.Resize, QEvent.Type.Move, QEvent.Type.Show, QEvent.Type.Hide, QEvent.Type.LayoutRequest,

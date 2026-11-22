@@ -203,6 +203,10 @@ class TrackTableModel(QAbstractTableModel):
     def ordered_track_ids(self) -> tuple[str, ...]:
         return tuple(item.track_id for item in self.tracks)
 
+    def track_for_id(self, track_id: str) -> TrackRecord | None:
+        row = self._row_by_id.get(track_id)
+        return self.tracks[row] if row is not None else None
+
     @staticmethod
     def calculate_grouped_order(
         order: tuple[str, ...], selected_ids: tuple[str, ...], destination: int
@@ -1060,6 +1064,18 @@ class TrackTableView(QTableView):
         current_row = self.track_model._row_by_id.get(current_id)
         if current_row is not None:
             selection_model.setCurrentIndex(self.track_model.index(current_row, 0), QItemSelectionModel.SelectionFlag.NoUpdate)
+
+    def select_find_track(self, track_id: str) -> bool:
+        row = self.track_model._row_by_id.get(track_id)
+        if row is None or not self.isEnabled() or self._drag is not None:
+            return False
+        index = self.track_model.index(row, 0)
+        self.selectionModel().setCurrentIndex(
+            index,
+            QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        self.scrollTo(index, QAbstractItemView.ScrollHint.EnsureVisible)
+        return True
 
     def _set_hover_row(self, row: int) -> None:
         row = row if 0 <= row < self.track_model.rowCount() else -1
